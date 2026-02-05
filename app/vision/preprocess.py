@@ -1,14 +1,20 @@
+from __future__ import annotations
+
 import io
 from PIL import Image, ImageEnhance
 
 def preprocess_to_png_bytes(raw: bytes) -> bytes:
+    """
+    Simple pre-processing for chart screenshots:
+    - convert to RGB
+    - upscale (helps small labels)
+    - mild contrast boost
+    """
     img = Image.open(io.BytesIO(raw)).convert("RGB")
 
-    # Basic upscale (helps small text)
     scale = 2
-    img = img.resize((img.size[0]*scale, img.size[1]*scale))
+    img = img.resize((img.size[0] * scale, img.size[1] * scale))
 
-    # Mild contrast boost
     img = ImageEnhance.Contrast(img).enhance(1.15)
 
     out = io.BytesIO()
