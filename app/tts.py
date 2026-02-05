@@ -69,13 +69,14 @@ async def generate_tts_mp3(
     client = AsyncOpenAI()
 
     # IMPORTANT: no `format=` arg (your SDK errors if provided)
-    resp = await client.audio.speech.create(
-        model=model,
-        voice=voice,
-        input=transcript,
-        # Do NOT add `format=` here (your logs show it breaks)
-        # Do NOT add `speed=` yet; we can add later if your SDK supports it
-    )
+    response = await client.audio.speech.create(
+    model=model,
+    voice=voice,
+    input=text,
+    response_format="mp3",   # <-- use this
+    speed=speed,
+)
+
 
     audio_bytes = _response_to_bytes(resp)
 
