@@ -8,13 +8,9 @@ from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
 
 # Local imports (works when running: uvicorn app.main:app)
-try:
-    from .tts import generate_tts_mp3
-    from .vision.pipeline import analyze_chart_image_bytes
-except Exception:
-    # Fallback for alternate run contexts
-    from tts import generate_tts_mp3  # type: ignore
-    from vision.pipeline import analyze_chart_image_bytes  # type: ignore
+from tts import generate_tts_mp3
+from vision.pipeline import analyze_chart_image_bytes
+
 
 
 app = FastAPI(title="TradeTalkerAI API")
