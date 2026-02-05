@@ -74,19 +74,21 @@ async def analyze_chart_image_bytes(raw_image_bytes: bytes, mode: str = "brief")
 
     # Call vision model and force JSON-only response via prompt
     resp = await client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": USER},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            },
-        ],
-        temperature=0,
+    model=VISION_MODEL,
+    messages=[
+        {"role": "system", "content": SYSTEM},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": USER},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        },
+    ],
+    temperature=0,
+    response_format={"type": "json_object"},
     )
+
 
     text = (resp.choices[0].message.content or "").strip()
 
