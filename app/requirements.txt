@@ -1,6 +1,12 @@
-fastapi
-uvicorn[standard]
-openai
-pydantic
-python-multipart
+fastapi==0.115.7
+uvicorn[standard]==0.34.0
+openai==1.61.0
+pydantic==2.10.5
+python-multipart==0.0.20
+
+redis==5.2.1
+rq==1.16.2
+boto3==1.35.92
+pillow==10.4.0
+
 
