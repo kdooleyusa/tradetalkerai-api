@@ -19,6 +19,22 @@ def _to_data_url_png(png_bytes: bytes) -> str:
     return f"data:image/png;base64,{b64}"
 
 
+def _strip_code_fences(text: str) -> str:
+    # Sometimes models wrap JSON in ```json ... ```
+    if "```" not in text:
+        return text.strip()
+    cleaned = text.replace("```json", "").replace("```", "").strip()
+    return cleaned
+
+
+def _fmt_levels(levels: list[float] | None) -> str | None:
+    if not levels:
+        return None
+    # Keep it short and readable for TTS
+    shown = levels[:4]
+    return ", ".join(str(x) for x in shown)
+
+
 def build_transcript_from_facts(f: ChartFacts, mode: str = "brief") -> str:
     # If we can't confidently read basics, say "keep looking"
     if f.confidence < 0.55 or not f.symbol or not f.timeframe:
@@ -39,15 +55,16 @@ def build_transcript_from_facts(f: ChartFacts, mode: str = "brief") -> str:
         parts.append(f"Premarket high {f.premarket_high}, low {f.premarket_low}.")
 
     # Levels
-    if f.support:
-        parts.append(f"Support near {f.support[:4]}.")
-    if f.resistance:
-        parts.append(f"Resistance near {f.resistance[:4]}.")
+    sup = _fmt_levels(f.support)
+    res = _fmt_levels(f.resistance)
+    if sup:
+        parts.append(f"Support near {sup}.")
+    if res:
+        parts.append(f"Resistance near {res}.")
 
     # Setup
     parts.append(f"Setup looks like {f.setup}.")
 
-    # Mode tuning (you can map brief/full/momentum later to F-keys)
     if mode == "brief":
         return " ".join(parts[:5])
 
@@ -64,7 +81,7 @@ async def analyze_chart_image_bytes(raw_image_bytes: bytes, mode: str = "brief")
     """
     Vision → ChartFacts → transcript
 
-    Uses Chat Completions with image input (works with AsyncOpenAI on openai==1.61.0).
+    Uses Chat Completions with image input (works with AsyncOpenAI on openai==1.61.0+).
     """
     client = AsyncOpenAI()
 
@@ -72,32 +89,44 @@ async def analyze_chart_image_bytes(raw_image_bytes: bytes, mode: str = "brief")
     png = preprocess_to_png_bytes(raw_image_bytes)
     data_url = _to_data_url_png(png)
 
-    # Call vision model and force JSON-only response via prompt
+    # Call vision model and force JSON object output
     resp = await client.chat.completions.create(
-    model=VISION_MODEL,
-    messages=[
-        {"role": "system", "content": SYSTEM},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": USER},
-                {"type": "image_url", "image_url": {"url": data_url}},
-            ],
-        },
-    ],
-    temperature=0,
-    response_format={"type": "json_object"},
+        model=VISION_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": USER},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+        temperature=0,
+        response_format={"type": "json_object"},
     )
 
-
     text = (resp.choices[0].message.content or "").strip()
+    text = _strip_code_fences(text)
 
     # Parse JSON into our schema
     try:
         data = json.loads(text)
+
+        # Defensive normalization (in case the model returns null or wrong types)
+        if data.get("support") is None:
+            data["support"] = []
+        if data.get("resistance") is None:
+            data["resistance"] = []
+        if not isinstance(data.get("support"), list):
+            data["support"] = []
+        if not isinstance(data.get("resistance"), list):
+            data["resistance"] = []
+
         facts = ChartFacts.model_validate(data)
-    except Exception:
-        facts = ChartFacts(confidence=0.0, notes=["Vision JSON parse failed"])
+
+    except Exception as e:
+        facts = ChartFacts(confidence=0.0, notes=[f"Vision JSON parse failed: {type(e).__name__}"])
         return facts, "I had trouble reading the chart output. Keep looking."
 
     transcript = build_transcript_from_facts(facts, mode=mode)
