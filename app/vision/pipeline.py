@@ -20,29 +20,34 @@ def _to_data_url_png(png_bytes: bytes) -> str:
 
 
 def _strip_code_fences(text: str) -> str:
-    # Sometimes models wrap JSON in ```json ... ```
     if "```" not in text:
         return text.strip()
-    cleaned = text.replace("```json", "").replace("```", "").strip()
-    return cleaned
+    return text.replace("```json", "").replace("```", "").strip()
 
 
-def _fmt_levels(levels: list[float] | None) -> str | None:
+def _fmt_level(x: float) -> str:
+    return f"{x:.2f}".rstrip("0").rstrip(".")
+
+
+def _fmt_levels(label: str, levels: list[float] | None) -> str | None:
     if not levels:
         return None
-    # Keep it short and readable for TTS
     shown = levels[:4]
-    return ", ".join(str(x) for x in shown)
+    if len(shown) == 1:
+        return f"{label} {_fmt_level(shown[0])}."
+    if len(shown) == 2:
+        return f"{label} {_fmt_level(shown[0])} then {_fmt_level(shown[1])}."
+    middle = ", ".join(_fmt_level(v) for v in shown[:-1])
+    last = _fmt_level(shown[-1])
+    return f"{label} {middle}, then {last}."
 
 
 def build_transcript_from_facts(f: ChartFacts, mode: str = "brief") -> str:
-    # If we can't confidently read basics, say "keep looking"
     if f.confidence < 0.55 or not f.symbol or not f.timeframe:
         return "I can’t read this chart clearly enough. Keep looking."
 
     parts: list[str] = []
 
-    # Core
     parts.append(f"{f.symbol} on {f.timeframe}. Price {f.last_price}.")
     parts.append(
         f"VWAP {f.vwap if f.vwap is not None else 'not visible'}, "
@@ -50,46 +55,45 @@ def build_transcript_from_facts(f: ChartFacts, mode: str = "brief") -> str:
         f"EMA21 {f.ema21 if f.ema21 is not None else 'n/a'}."
     )
 
-    # Premarket
     if f.premarket_high is not None or f.premarket_low is not None:
         parts.append(f"Premarket high {f.premarket_high}, low {f.premarket_low}.")
 
-    # Levels
-    sup = _fmt_levels(f.support)
-    res = _fmt_levels(f.resistance)
+    sup = _fmt_levels("Support", f.support)
+    res = _fmt_levels("Resistance", f.resistance)
     if sup:
-        parts.append(f"Support near {sup}.")
+        parts.append(sup)
     if res:
-        parts.append(f"Resistance near {res}.")
+        parts.append(res)
 
-    # Setup
-    parts.append(f"Setup looks like {f.setup}.")
+    pretty = {
+        "breakout": "a breakout",
+        "pullback": "a pullback",
+        "failed breakout": "a failed breakout",
+        "range": "range-bound",
+        "unclear": "unclear",
+    }.get(f.setup or "unclear", f.setup or "unclear")
+    parts.append(f"Setup: {pretty}.")
+
+    if f.support:
+        parts.append(f"Invalidate below {_fmt_level(f.support[0])}.")
 
     if mode == "brief":
-        return " ".join(parts[:5])
+        return " ".join(parts[:6])
 
     if mode == "momentum":
-        return " ".join(parts[:5]) + " Momentum focus: watch the next resistance break; invalidate on support loss."
+        return " ".join(parts[:6]) + " Momentum focus: watch the next resistance break; invalidate on support loss."
 
-    # Full
     if f.notes:
         parts.append("Notes: " + " ".join(f.notes[:3]))
     return " ".join(parts)
 
 
 async def analyze_chart_image_bytes(raw_image_bytes: bytes, mode: str = "brief") -> Tuple[ChartFacts, str]:
-    """
-    Vision → ChartFacts → transcript
-
-    Uses Chat Completions with image input (works with AsyncOpenAI on openai==1.61.0+).
-    """
     client = AsyncOpenAI()
 
-    # Preprocess (upscale/contrast) for better readability
     png = preprocess_to_png_bytes(raw_image_bytes)
     data_url = _to_data_url_png(png)
 
-    # Call vision model and force JSON object output
     resp = await client.chat.completions.create(
         model=VISION_MODEL,
         messages=[
@@ -106,25 +110,15 @@ async def analyze_chart_image_bytes(raw_image_bytes: bytes, mode: str = "brief")
         response_format={"type": "json_object"},
     )
 
-    text = (resp.choices[0].message.content or "").strip()
-    text = _strip_code_fences(text)
+    text = _strip_code_fences((resp.choices[0].message.content or "").strip())
 
-    # Parse JSON into our schema
     try:
         data = json.loads(text)
-
-        # Defensive normalization (in case the model returns null or wrong types)
-        if data.get("support") is None:
+        if data.get("support") is None or not isinstance(data.get("support"), list):
             data["support"] = []
-        if data.get("resistance") is None:
+        if data.get("resistance") is None or not isinstance(data.get("resistance"), list):
             data["resistance"] = []
-        if not isinstance(data.get("support"), list):
-            data["support"] = []
-        if not isinstance(data.get("resistance"), list):
-            data["resistance"] = []
-
         facts = ChartFacts.model_validate(data)
-
     except Exception as e:
         facts = ChartFacts(confidence=0.0, notes=[f"Vision JSON parse failed: {type(e).__name__}"])
         return facts, "I had trouble reading the chart output. Keep looking."
