@@ -8,5 +8,5 @@ redis==5.2.1
 rq==1.16.2
 boto3==1.35.92
 pillow==10.4.0
-
-
+botocore
+python-dotenv
