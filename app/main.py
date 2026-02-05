@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from pathlib import Path
@@ -7,11 +8,12 @@ from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
 
-# Local imports (works when running: uvicorn app.main:app)
+# NOTE:
+# This file assumes Railway Root Directory is set to "app"
+# and the start command is: uvicorn main:app --host 0.0.0.0 --port $PORT
+
 from tts import generate_tts_mp3
 from vision.pipeline import analyze_chart_image_bytes
-
-
 
 app = FastAPI(title="TradeTalkerAI API")
 
@@ -19,6 +21,15 @@ app = FastAPI(title="TradeTalkerAI API")
 # NOTE: On Railway, local disk is ephemeral between deploys/restarts.
 AUDIO_DIR = Path(os.getenv("AUDIO_DIR", "./storage/audio")).expanduser().resolve()
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+# Optional: store uploaded charts for debugging (set SAVE_UPLOADS=1)
+SAVE_UPLOADS = os.getenv("SAVE_UPLOADS", "0") == "1"
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./storage/uploads")).expanduser().resolve()
+if SAVE_UPLOADS:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Optional: Vision timeout (seconds). If Vision hangs, return a clean 500 instead of Railway 502.
+VISION_TIMEOUT_S = float(os.getenv("VISION_TIMEOUT_S", "25"))
 
 # Serve audio files
 app.mount("/audio", StaticFiles(directory=str(AUDIO_DIR)), name="audio")
@@ -66,6 +77,10 @@ async def analyze(
     if not raw:
         raise HTTPException(status_code=400, detail="Empty image upload")
 
+    # Optional: validate basic content-type (best-effort)
+    if image.content_type and not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail=f"Unsupported content_type: {image.content_type}")
+
     # Swagger defaults often come through as literal "string"
     if voice in ("", "string"):
         voice = None
@@ -77,6 +92,7 @@ async def analyze(
     if speed not in (None, "", "string"):
         try:
             speed_f = float(speed)
+            # treat <=0 as "not set"
             if speed_f <= 0:
                 speed_f = None
         except ValueError:
@@ -84,9 +100,27 @@ async def analyze(
 
     analysis_id = f"chart_{uuid.uuid4().hex[:8]}"
 
-    # 1) Vision -> ChartFacts -> transcript
+    # Optional: save upload for debugging
+    if SAVE_UPLOADS:
+        # choose extension based on content type if possible
+        ext = ".png"
+        if image.content_type == "image/jpeg":
+            ext = ".jpg"
+        elif image.content_type == "image/webp":
+            ext = ".webp"
+        (UPLOAD_DIR / f"{analysis_id}{ext}").write_bytes(raw)
+
+    # 1) Vision -> ChartFacts -> transcript (with timeout to avoid gateway 502)
     try:
-        chart_facts, transcript = await analyze_chart_image_bytes(raw, mode=mode)
+        chart_facts, transcript = await asyncio.wait_for(
+            analyze_chart_image_bytes(raw, mode=mode),
+            timeout=VISION_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Vision failed: TimeoutError after {VISION_TIMEOUT_S:.0f}s",
+        )
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -122,4 +156,6 @@ async def analyze(
         "mp3_bytes": mp3_path.stat().st_size if mp3_path.exists() else 0,
         "audio_dir": str(AUDIO_DIR),
         "filename": mp3_path.name,
+        "vision_timeout_s": VISION_TIMEOUT_S,
+        "saved_upload": SAVE_UPLOADS,
     }
