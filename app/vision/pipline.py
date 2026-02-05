@@ -1,54 +1,90 @@
+from __future__ import annotations
+
+import base64
 import json
-from openai import OpenAI
-from ..core.config import settings
-from ..core.s3 import presigned_get_url
-from .schema import ChartFacts, VisionResult, Mode
-from .prompt import SYSTEM, user_prompt
+import os
+from typing import Tuple
 
-client = OpenAI(api_key=settings.openai_api_key)
+from openai import AsyncOpenAI
 
-def analyze_image_key(image_id: str, s3_key: str, mode: Mode) -> VisionResult:
-    img_url = presigned_get_url(s3_key, expires_sec=600)
+from .schema import ChartFacts
+from .preprocess import preprocess_to_png_bytes
+from .prompt import SYSTEM, USER
 
-    resp = client.responses.create(
-        model=settings.vision_model,
+DEFAULT_VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
+
+def _to_data_url_png(png_bytes: bytes) -> str:
+    b64 = base64.b64encode(png_bytes).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
+
+def build_transcript_from_facts(f: ChartFacts, mode: str = "brief") -> str:
+    """
+    mode: brief | full | momentum (you can map your F8/F9/F10 later)
+    """
+    if f.confidence < 0.55 or not f.symbol or not f.timeframe:
+        return "I can’t read this chart clearly enough. Keep looking."
+
+    parts = []
+    parts.append(f"{f.symbol} on {f.timeframe}. Price {f.last_price}.")
+
+    parts.append(
+        f"VWAP {f.vwap if f.vwap is not None else 'not visible'}, "
+        f"EMA9 {f.ema9 if f.ema9 is not None else 'n/a'}, "
+        f"EMA21 {f.ema21 if f.ema21 is not None else 'n/a'}."
+    )
+
+    if f.premarket_high is not None or f.premarket_low is not None:
+        parts.append(f"Premarket high {f.premarket_high}, low {f.premarket_low}.")
+
+    if f.support:
+        parts.append(f"Support near {f.support[:4]}.")
+    if f.resistance:
+        parts.append(f"Resistance near {f.resistance[:4]}.")
+
+    parts.append(f"Setup looks like {f.setup}.")
+
+    if mode == "brief":
+        # keep it tight
+        return " ".join(parts[:5])
+
+    if mode == "momentum":
+        return " ".join(parts[:5]) + " Momentum focus: watch the next resistance break; invalidate on support loss."
+
+    # full
+    if f.notes:
+        parts.append("Notes: " + " ".join(f.notes[:3]))
+    return " ".join(parts)
+
+async def analyze_chart_image_bytes(raw_image_bytes: bytes, mode: str = "brief") -> Tuple[ChartFacts, str]:
+    """
+    Returns (chart_facts, transcript)
+    """
+    client = AsyncOpenAI()
+
+    png = preprocess_to_png_bytes(raw_image_bytes)
+    data_url = _to_data_url_png(png)
+
+    # Use the Responses API with image input (works with the current OpenAI SDK style)
+    resp = await client.responses.create(
+        model=DEFAULT_VISION_MODEL,
         input=[{
             "role": "user",
             "content": [
-                {"type": "input_text", "text": SYSTEM + "\n" + user_prompt(mode)},
-                {"type": "input_image", "image_url": img_url, "detail": "high"},
+                {"type": "input_text", "text": SYSTEM + "\n" + USER},
+                {"type": "input_image", "image_url": data_url, "detail": "high"},
             ],
         }],
-        # If your model supports strict structured outputs in your setup,
-        # you can enforce JSON more strongly; for now we parse defensively.
     )
 
-    text = resp.output_text.strip()
-    data = json.loads(text)
-    facts = ChartFacts.model_validate(data)
+    text = (resp.output_text or "").strip()
 
-    # simple gating
-    keep_looking = facts.confidence < 0.55 or not facts.symbol or not facts.timeframe
-    narration = build_narration(facts, mode, keep_looking)
+    # Defensive JSON parsing
+    try:
+        data = json.loads(text)
+        facts = ChartFacts.model_validate(data)
+    except Exception:
+        facts = ChartFacts(confidence=0.0, notes=["Vision JSON parse failed"])
+        return facts, "I had trouble reading the chart output. Keep looking."
 
-    return VisionResult(
-        image_id=image_id,
-        mode=mode,
-        chart_facts=facts,
-        narration_text=narration,
-        keep_looking=keep_looking,
-    )
-
-def build_narration(f: ChartFacts, mode: Mode, keep: bool) -> str:
-    if keep:
-        return "I can’t read enough from this screenshot with confidence. Keep looking."
-
-    core = f"{f.symbol} on {f.timeframe}. Trend looks {f.trend}. "
-    lvl = f"Support {f.levels.support[:2]} and resistance {f.levels.resistance[:2]}. "
-    extra = " ".join(f.notes[:3])
-
-    if mode == "f10":
-        return core + lvl + "Momentum focus: watch the next resistance break; invalidate on support loss. " + extra
-    if mode == "f9":
-        return core + lvl + extra
-    return core + lvl + "Patterns: " + ", ".join(f.patterns[:3]) + ". " + extra
+    transcript = build_transcript_from_facts(facts, mode=mode)
+    return facts, transcript
