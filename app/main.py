@@ -3,7 +3,7 @@ from fastapi.staticfiles import StaticFiles
 import os
 import uuid
 
-from app.tts import generate_tts_mp3
+from tts import generate_tts_mp3
 
 app = FastAPI()
 
