@@ -1,14 +1,26 @@
-from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
-from fastapi.staticfiles import StaticFiles
+from __future__ import annotations
+
 import os
 import uuid
 from pathlib import Path
 
-from tts import generate_tts_mp3
+from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
+from fastapi.staticfiles import StaticFiles
+
+# Local imports (works when running: uvicorn app.main:app)
+try:
+    from .tts import generate_tts_mp3
+    from .vision.pipeline import analyze_chart_image_bytes
+except Exception:
+    # Fallback for alternate run contexts
+    from tts import generate_tts_mp3  # type: ignore
+    from vision.pipeline import analyze_chart_image_bytes  # type: ignore
+
 
 app = FastAPI(title="TradeTalkerAI API")
 
-# Make sure AUDIO_DIR is ABSOLUTE and used consistently
+# AUDIO_DIR must be absolute and consistent.
+# NOTE: On Railway, local disk is ephemeral between deploys/restarts.
 AUDIO_DIR = Path(os.getenv("AUDIO_DIR", "./storage/audio")).expanduser().resolve()
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -40,36 +52,66 @@ async def analyze(
     request: Request,
     image: UploadFile = File(...),
     mode: str = Form("brief"),
-    # Optional overrides (nice for quick testing in Swagger)
+    # Optional overrides (nice for Swagger testing)
     voice: str | None = Form(None),
     model: str | None = Form(None),
-    speed: float | None = Form(None),
+    # Accept as string so Swagger empty values don't 422
+    speed: str | None = Form(None),
 ):
     """
-    Phase 1: TTS smoke test endpoint.
-    - Accepts an uploaded image (unused for now)
-    - Generates a test transcript
-    - Returns an mp3 served from /audio
+    Phase 2: Vision + TTS
+    - Upload chart screenshot
+    - Extract ChartFacts via OpenAI Vision
+    - Convert to a spoken transcript
+    - Generate MP3 via OpenAI TTS
     """
 
-    # Basic upload sanity check (prevents empty uploads)
     raw = await image.read()
     if not raw:
         raise HTTPException(status_code=400, detail="Empty image upload")
 
-    # For now we use a fake transcript just to test TTS
-    transcript = "TradeTalkerAI is running. This is your test audio."
+    # Swagger defaults often come through as literal "string"
+    if voice in ("", "string"):
+        voice = None
+    if model in ("", "string"):
+        model = None
 
-    analysis_id = f"test_{uuid.uuid4().hex[:8]}"
+    # Parse speed safely (Swagger may send "")
+    speed_f: float | None = None
+    if speed not in (None, "", "string"):
+        try:
+            speed_f = float(speed)
+            if speed_f <= 0:
+                speed_f = None
+        except ValueError:
+            speed_f = None
 
-    mp3_path, audio_url = await generate_tts_mp3(
-        transcript=transcript,
-        analysis_id=analysis_id,
-        out_dir=AUDIO_DIR,
-        voice=voice,
-        model=model,
-        speed=speed,
-    )
+    analysis_id = f"chart_{uuid.uuid4().hex[:8]}"
+
+    # 1) Vision -> ChartFacts -> transcript
+    try:
+        chart_facts, transcript = await analyze_chart_image_bytes(raw, mode=mode)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Vision failed: {type(e).__name__}: {e}",
+        )
+
+    # 2) TTS -> MP3
+    try:
+        mp3_path, audio_url = await generate_tts_mp3(
+            transcript=transcript,
+            analysis_id=analysis_id,
+            out_dir=AUDIO_DIR,
+            voice=voice,
+            model=model,
+            speed=speed_f,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"TTS failed: {type(e).__name__}: {e}",
+        )
 
     # Build a full URL you can click
     base = str(request.base_url).rstrip("/")
@@ -77,6 +119,7 @@ async def analyze(
 
     return {
         "mode": mode,
+        "chart_facts": chart_facts.model_dump(),
         "transcript": transcript,
         "audio_url": audio_url,
         "audio_full_url": audio_full_url,
