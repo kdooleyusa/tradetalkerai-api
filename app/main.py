@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from tts import generate_tts_mp3
 from vision.pipeline import analyze_chart_image_bytes
 from vision.l2_pipeline import analyze_l2_image_bytes, compute_l2_delta, build_l2_commentary
+from vision.trade_logic import compute_trade_plan  # NEW: return trade_plan JSON
 
 app = FastAPI(title="TradeTalkerAI API")
 
@@ -48,7 +49,7 @@ async def analyze(
     frame_delay_ms: int | None = Form(None),
 ):
     """
-    Phase 2+: Vision + 2-frame Level2 snapshot inference + TTS
+    Phase 3: Vision + Trade Logic + optional 2-frame Level2 inference + TTS
 
     Send:
       - image  (required)
@@ -107,6 +108,11 @@ async def analyze(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chart vision failed: {type(e).__name__}: {e}")
 
+    # ---- 1b) Trade plan (deterministic) ----
+    # NOTE: pipeline already appends plan speech when actionable; we compute again here
+    # so you get a structured JSON object in the API response.
+    trade_plan = compute_trade_plan(chart_facts, mode=mode)
+
     # ---- 2) Level 2 snapshot from frame 1 (and frame 2 if provided) ----
     l2_1 = None
     l2_2 = None
@@ -138,11 +144,13 @@ async def analyze(
     if l2_comment:
         transcript = transcript_core + " " + l2_comment
 
+    # Keep-looking logic: include trade_plan.step_aside as an additional gate.
     keep_looking = bool(
         (chart_facts.confidence is not None and chart_facts.confidence < 0.55)
         or (chart_facts.setup in (None, "unclear"))
         or (not chart_facts.symbol)
         or (not chart_facts.timeframe)
+        or bool(trade_plan.step_aside)
     )
     verdict = "keep_looking" if keep_looking else "actionable"
 
@@ -172,6 +180,7 @@ async def analyze(
         "keep_looking": keep_looking,
         "confidence": chart_facts.confidence,
         "chart_facts": chart_facts.model_dump(),
+        "trade_plan": trade_plan.model_dump(),  # NEW
         "l2_frame1": l2_1.model_dump() if l2_1 else None,
         "l2_frame2": l2_2.model_dump() if l2_2 else None,
         "l2_delta": l2_delta.model_dump() if l2_delta else None,
