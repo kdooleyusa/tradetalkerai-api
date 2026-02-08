@@ -1,7 +1,8 @@
-from __future__ import annotations
+# Add these models to your existing app/vision/schema.py
 
+from __future__ import annotations
 from pydantic import BaseModel, Field
-from typing import Optional, List, Literal
+from typing import List, Optional
 
 SetupType = Literal["breakout", "pullback", "failed breakout", "range", "unclear"]
 
@@ -24,3 +25,40 @@ class ChartFacts(BaseModel):
 
     confidence: float = 0.0
     notes: List[str] = Field(default_factory=list)
+
+
+
+class L2Row(BaseModel):
+    price: float
+    size: Optional[float] = None  # shares (normalized)
+
+class L2Snapshot(BaseModel):
+    ladder_visible: bool = False
+    best_bid_price: Optional[float] = None
+    best_bid_size: Optional[float] = None
+    best_ask_price: Optional[float] = None
+    best_ask_size: Optional[float] = None
+    bids: List[L2Row] = Field(default_factory=list)
+    asks: List[L2Row] = Field(default_factory=list)
+
+    # convenience metrics (filled in post)
+    bid_sum: float = 0.0
+    ask_sum: float = 0.0
+    imbalance: Optional[float] = None  # bid_sum / (bid_sum + ask_sum)
+
+class L2Delta(BaseModel):
+    bid_sum_a: float = 0.0
+    bid_sum_b: float = 0.0
+    ask_sum_a: float = 0.0
+    ask_sum_b: float = 0.0
+    bid_sum_change: float = 0.0
+    ask_sum_change: float = 0.0
+
+    imbalance_a: Optional[float] = None
+    imbalance_b: Optional[float] = None
+    imbalance_change: Optional[float] = None
+
+    bid_pull_count: int = 0
+    bid_add_count: int = 0
+    ask_pull_count: int = 0
+    ask_add_count: int = 0
