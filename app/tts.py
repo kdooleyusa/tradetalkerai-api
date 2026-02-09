@@ -58,8 +58,8 @@ async def generate_tts_mp3(
     # voice = "onyx"  # ED
     # voice = "alloy"  # ED
     # voice = "verse"  # ED
-    voice = "echo"  # ED
-    # voice = "nova"  # ED
+    # voice = "echo"  # ED
+    voice = "nova"  # ED
     # voice = "marin"  # ED
     # voice = "verse"  # ED
     
