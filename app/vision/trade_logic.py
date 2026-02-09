@@ -227,36 +227,6 @@ def _fmt_levels(label: str, levels: list[float] | None) -> str | None:
     return f"{label} {middle}, then {last}."
 
 
-def _fmt(x: Optional[float]) -> Optional[str]:
-    if x is None:
-        return None
-    s = f"{x:.2f}".rstrip("0").rstrip(".")
-    return s
-
-
-def _short_l2(l2_comment: Optional[str]) -> Optional[str]:
-    """Only keep high-signal L2 phrases. Drop filler."""
-    if not l2_comment:
-        return None
-    low = l2_comment.lower()
-
-    keep = (
-        "asks strengthening",
-        "bids strengthening",
-        "asks thinning",
-        "bids thinning",
-        "bids add",
-        "asks add",
-        "asks pulling",
-        "bids pulling",
-        "bids stacked",
-        "asks stacked",
-    )
-    if any(k in low for k in keep):
-        return l2_comment.strip().rstrip(".") + "."
-    return None
-
-
 def _confidence_adj(conf: float | None) -> str:
     if conf is None:
         return "unknown-confidence"
@@ -269,22 +239,53 @@ def _confidence_adj(conf: float | None) -> str:
     return "very-low-confidence"
 
 
-def _sentiment_word(setup: str | None, side: str | None, l2_comment: Optional[str]) -> str:
-    # tiny, scanner-style words
-    setup = (setup or "unclear").lower().strip()
-    side = (side or "none").lower().strip()
+def _confidence_pct(conf: float | None) -> str:
+    if conf is None:
+        return ""
+    pct = int(round(conf * 100))
+    return f"{pct} percent"
 
-    if setup == "range":
+
+def _short_l2(l2_comment: str | None) -> str | None:
+    # Keep only high-signal L2 phrases; drop filler.
+    if not l2_comment:
+        return None
+    low = l2_comment.lower().strip()
+    drop = ("not visible", "timed out", "failed", "captured")
+    if any(d in low for d in drop):
+        return None
+    allow = (
+        "asks strengthening",
+        "bids strengthening",
+        "asks thinning",
+        "bids thinning",
+        "asks pulling",
+        "bids pulling",
+        "asks stacked",
+        "bids stacked",
+        "asks add",
+        "bids add",
+    )
+    if any(a in low for a in allow):
+        return l2_comment.strip().rstrip(".") + "."
+    return None
+
+
+def _sentiment_word(setup: str | None, side: str | None, l2_short: str | None) -> str:
+    setup_l = (setup or "unclear").lower().strip()
+    side_l = (side or "none").lower().strip()
+
+    if setup_l == "range":
         return "choppy"
-    if setup == "breakout":
+    if setup_l == "breakout":
         return "hot"
-    if setup == "pullback":
+    if setup_l == "pullback":
         return "reset"
-    if setup == "failed breakout":
+    if setup_l == "failed breakout":
         return "rejecting"
-    # If L2 is strong, let it influence a tiny sentiment
-    if l2_comment:
-        low = l2_comment.lower()
+
+    if l2_short:
+        low = l2_short.lower()
         if "asks strengthening" in low or "asks stacked" in low:
             return "heavy"
         if "bids strengthening" in low or "bids stacked" in low:
@@ -293,12 +294,23 @@ def _sentiment_word(setup: str | None, side: str | None, l2_comment: Optional[st
             return "lifting"
         if "bids thinning" in low:
             return "soft"
-    # fallback based on side
-    if side == "long":
+
+    if side_l == "long":
         return "bullish"
-    if side == "short":
+    if side_l == "short":
         return "bearish"
     return "foggy"
+
+
+def _mode_norm(mode: str | None) -> str:
+    m = (mode or "brief").strip().lower()
+    if m in ("momo", "momentum", "mom"):
+        return "momentum"
+    if m in ("full", "detail", "detailed"):
+        return "full"
+    if m in ("brief", "quick", "scan"):
+        return "brief"
+    return m
 
 
 def build_trade_transcript(
@@ -308,17 +320,21 @@ def build_trade_transcript(
     mode: str = "brief",
 ) -> str:
     """
-    Mode A+ (Ultra-short screener voice, slightly richer):
-      - Adds confidence adjective + tiny sentiment word
-      - Unclear path: "SYMBOL high-confidence. Price X. choppy. Position unclear because ... Move on."
-      - Actionable path stays short: entry/stop/target in one line
+    Screener voice:
+      - No internal tokens like 'setup=', 'confidence=', 'l2_score='
+      - Confidence spoken as adjective; percent only in full mode
+      - Quality spoken as 'A quality', 'B quality', etc.
+      - Mode alias: 'momo' treated as momentum
     """
+    mode = _mode_norm(mode)
+
     symbol = (facts.symbol or "Chart").strip()
     setup = (facts.setup or "unclear").strip()
     adj = _confidence_adj(facts.confidence)
-    price = _fmt(facts.last_price) or "?"
-    l2 = _short_l2(l2_comment)
-    senti = _sentiment_word(setup, plan.side, l2)
+    pct = _confidence_pct(facts.confidence)
+    price = _fmt_level(facts.last_price) if facts.last_price is not None else "?"
+    l2_short = _short_l2(l2_comment)
+    senti = _sentiment_word(setup, plan.side, l2_short)
 
     # ---- Unclear / move-on gates ----
     if facts.confidence is None or facts.confidence < 0.55:
@@ -330,55 +346,57 @@ def build_trade_transcript(
     if setup.lower() == "unclear":
         return f"{symbol} {adj}. Price {price}. {senti}. Position unclear because setup not confirmed. Move on."
 
-    # Step-aside/no-trade -> move on (ultra short)
+    # Step-aside/no-trade -> move on
     if plan.side in (None, "none") or plan.step_aside:
-        reason = None
-        if plan.step_aside:
-            reason = plan.step_aside[0].rstrip(".")
+        reason = plan.step_aside[0].rstrip(".") if plan.step_aside else None
         if mode == "brief" or not reason:
             out = f"{symbol} {adj}. Price {price}. {senti}. Move on."
         else:
             out = f"{symbol} {adj}. Price {price}. {senti}. {reason}. Move on."
-        if l2:
-            out = out.rstrip(".") + ". " + l2
-        return out[:220].rstrip()
+        if l2_short:
+            out = out.rstrip(".") + ". " + l2_short
+        return out[:240].rstrip()
 
-    entry = _fmt(plan.entry)
-    stop = _fmt(plan.stop)
-    t1 = _fmt(plan.targets[0]) if plan.targets else None
+    # Actionable
+    entry = _fmt_level(plan.entry) if plan.entry is not None else None
+    stop = _fmt_level(plan.stop) if plan.stop is not None else None
+    t1 = _fmt_level(plan.targets[0]) if getattr(plan, "targets", None) else None
 
-    # ---- BRIEF ----
+    q = (plan.quality or "C").strip().upper()
+    q_spoken = f"{q} quality"
+
     if mode == "brief":
-        bits = [f"{symbol} {adj}.", f"Price {price}.", f"{senti}."]
+        bits = [f"{symbol} {adj}.", f"Price {price}.", f"{senti}.", q_spoken + "."]
         if entry and stop and t1:
             bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
         elif entry and stop:
             bits.append(f"Entry {entry}, stop {stop}.")
-        else:
-            bits.append("Move on.")
-        if l2:
-            bits.append(l2)
-        return " ".join(bits)[:180].rstrip()
+        if l2_short:
+            bits.append(l2_short)
+        return " ".join(bits)[:210].rstrip()
 
-    # ---- MOMENTUM ----
     if mode == "momentum":
-        bits = [f"{symbol} {adj}.", f"Price {price}.", f"{senti}."]
+        bits = [f"{symbol} {adj}.", f"Price {price}.", f"{senti}.", q_spoken + "."]
         if entry and stop and t1:
             bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
         if entry and stop:
             bits.append(f"Trigger {entry}. Invalidate {stop}.")
-        if l2:
-            bits.append(l2)
-        return " ".join(bits)[:240].rstrip()
+        if l2_short:
+            bits.append(l2_short)
+        return " ".join(bits)[:270].rstrip()
 
-    # ---- FULL (still short) ----
-    bits = [f"{symbol} {adj}.", f"Price {price}.", f"{senti}."]
+    # full
+    bits = [f"{symbol} {adj} ({pct}).", f"Price {price}.", f"{senti}.", q_spoken + "."]
     if entry and stop and t1:
         bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
     elif entry and stop:
         bits.append(f"Entry {entry}, stop {stop}.")
-    if plan.rationale:
-        bits.append(plan.rationale[0].rstrip(".") + ".")
-    if l2:
-        bits.append(l2)
-    return " ".join(bits)[:320].rstrip()
+    # Add at most one human rationale line, skipping token-y ones
+    for r in (plan.rationale or []):
+        if any(tok in r for tok in ("Setup=", "confidence=", "l2_score=")):
+            continue
+        bits.append(r.rstrip(".") + ".")
+        break
+    if l2_short:
+        bits.append(l2_short)
+    return " ".join(bits)[:340].rstrip()
