@@ -42,6 +42,8 @@ async def analyze(
     mode: str = Form("brief"),
     model: str | None = Form(None),
     speed: str | None = Form(None),
+    # Voice selector (1..6). Default 1 = onyx
+    voice: int = Form(1),
     save_chart: bool = Form(False),
     frame_delay_ms: int | None = Form(None),
 ):
@@ -67,7 +69,16 @@ async def analyze(
         except ValueError:
             speed_f = None
 
-    analysis_id = f"chart_{uuid.uuid4().hex[:8]}"
+    
+    # Validate voice id
+    try:
+        voice = int(voice)
+    except Exception:
+        raise HTTPException(status_code=400, detail="voice must be an integer 1..6")
+    if voice < 1 or voice > 6:
+        raise HTTPException(status_code=400, detail="voice must be in range 1..6")
+
+analysis_id = f"chart_{uuid.uuid4().hex[:8]}"
 
     saved = {"image": None, "image2": None}
     if save_chart:
@@ -146,6 +157,7 @@ async def analyze(
                 out_dir=Path(os.getenv("AUDIO_DIR", "./storage/audio")).expanduser().resolve(),
                 model=model,
                 speed=speed_f,
+                voice=voice,
             ),
             timeout=float(os.getenv("TTS_TIMEOUT_SEC", "25")),
         )
@@ -159,6 +171,7 @@ async def analyze(
 
     return {
         "mode": mode,
+        "voice": voice,
         "verdict": verdict,
         "keep_looking": keep_looking,
         "confidence": chart_facts.confidence,
