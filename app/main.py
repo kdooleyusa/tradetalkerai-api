@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from tts import generate_tts_mp3
 from vision.pipeline import analyze_chart_image_bytes
 from vision.l2_pipeline import analyze_l2_image_bytes, compute_l2_delta, build_l2_commentary
-from vision.trade_logic import compute_trade_plan  # NEW: return trade_plan JSON
+from vision.trade_logic import build_trade_plan, build_trade_transcript
 
 app = FastAPI(title="TradeTalkerAI API")
 
@@ -38,23 +38,13 @@ def health():
 async def analyze(
     request: Request,
     image: UploadFile = File(...),
-    # Optional 2nd frame (send ~0.5s–1.5s later)
-    image2: UploadFile | None = File(None),
+    image2: UploadFile | None = File(None),  # optional 2nd frame (~0.5–1.5s later)
     mode: str = Form("brief"),
     model: str | None = Form(None),
     speed: str | None = Form(None),
-    # If True, save uploads in /storage/charts for debugging
     save_chart: bool = Form(False),
-    # Optional metadata from helper app
     frame_delay_ms: int | None = Form(None),
 ):
-    """
-    Phase 3: Vision + Trade Logic + optional 2-frame Level2 inference + TTS
-
-    Send:
-      - image  (required)
-      - image2 (optional; second screenshot ~500-1500ms later)
-    """
     raw1 = await image.read()
     if not raw1:
         raise HTTPException(status_code=400, detail="Empty image upload (image)")
@@ -68,7 +58,6 @@ async def analyze(
     if model in ("", "string"):
         model = None
 
-    # Parse speed safely (Swagger may send "")
     speed_f: float | None = None
     if speed not in (None, "", "string"):
         try:
@@ -97,9 +86,9 @@ async def analyze(
             (CHART_DIR / fn2).write_bytes(raw2)
             saved["image2"] = fn2
 
-    # ---- 1) Chart facts from frame 1 ----
+    # 1) Chart facts
     try:
-        chart_facts, transcript_core = await asyncio.wait_for(
+        chart_facts, _legacy = await asyncio.wait_for(
             analyze_chart_image_bytes(raw1, mode=mode),
             timeout=float(os.getenv("VISION_TIMEOUT_SEC", "25")),
         )
@@ -108,12 +97,7 @@ async def analyze(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chart vision failed: {type(e).__name__}: {e}")
 
-    # ---- 1b) Trade plan (deterministic) ----
-    # NOTE: pipeline already appends plan speech when actionable; we compute again here
-    # so you get a structured JSON object in the API response.
-    trade_plan = compute_trade_plan(chart_facts, mode=mode)
-
-    # ---- 2) Level 2 snapshot from frame 1 (and frame 2 if provided) ----
+    # 2) L2
     l2_1 = None
     l2_2 = None
     l2_delta = None
@@ -134,33 +118,32 @@ async def analyze(
         else:
             l2_comment = build_l2_commentary(l2_1, None, None)
     except asyncio.TimeoutError:
-        # Don't fail the whole request — just omit L2
         l2_comment = "Level 2 read timed out."
     except Exception as e:
         l2_comment = f"Level 2 read failed: {type(e).__name__}: {e}"
 
-    # ---- 3) Merge transcript ----
-    transcript = transcript_core
-    if l2_comment:
-        transcript = transcript_core + " " + l2_comment
+    # 3) TradePlan
+    trade_plan = build_trade_plan(chart_facts, l2_1, l2_2, l2_delta)
 
-    # Keep-looking logic: include trade_plan.step_aside as an additional gate.
+    # 4) Transcript (now mode actually changes output)
+    transcript = build_trade_transcript(chart_facts, trade_plan, l2_comment=l2_comment, mode=mode)
+
     keep_looking = bool(
         (chart_facts.confidence is not None and chart_facts.confidence < 0.55)
         or (chart_facts.setup in (None, "unclear"))
         or (not chart_facts.symbol)
         or (not chart_facts.timeframe)
-        or bool(trade_plan.step_aside)
+        or (trade_plan.side == "none")
     )
     verdict = "keep_looking" if keep_looking else "actionable"
 
-    # ---- 4) TTS ----
+    # 5) TTS
     try:
         mp3_path, audio_url = await asyncio.wait_for(
             generate_tts_mp3(
                 transcript=transcript,
                 analysis_id=analysis_id,
-                out_dir=AUDIO_DIR,
+                out_dir=Path(os.getenv("AUDIO_DIR", "./storage/audio")).expanduser().resolve(),
                 model=model,
                 speed=speed_f,
             ),
@@ -180,7 +163,7 @@ async def analyze(
         "keep_looking": keep_looking,
         "confidence": chart_facts.confidence,
         "chart_facts": chart_facts.model_dump(),
-        "trade_plan": trade_plan.model_dump(),  # NEW
+        "trade_plan": trade_plan.model_dump(),
         "l2_frame1": l2_1.model_dump() if l2_1 else None,
         "l2_frame2": l2_2.model_dump() if l2_2 else None,
         "l2_delta": l2_delta.model_dump() if l2_delta else None,
