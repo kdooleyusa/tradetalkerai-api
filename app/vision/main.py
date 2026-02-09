@@ -159,13 +159,14 @@ async def analyze(
 
     keep_looking = bool(
         (chart_facts.confidence is not None and chart_facts.confidence < 0.55)
-        or (chart_facts.setup in (None, "unclear"))
+        or (chart_facts.setup in (None, "unclear", "range"))
         or (not chart_facts.symbol)
         or (not chart_facts.timeframe)
-        or (trade_plan.side in (None, "none"))
         or bool(trade_plan.step_aside)
+        or (trade_plan.quality in ("D", "F"))
     )
     verdict = "keep_looking" if keep_looking else "actionable"
+
 
 
     # 5) TTS
