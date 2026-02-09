@@ -64,8 +64,15 @@ def _normalize_rows(rows) -> list[L2Row]:
 def _sum_sizes(rows: list[L2Row]) -> float:
     return float(sum((x.size or 0.0) for x in rows))
 
+def _has_meaningful_l2(snap: L2Snapshot) -> bool:
+    if snap.best_bid_price is not None or snap.best_ask_price is not None:
+        return True
+    if snap.bids or snap.asks:
+        return True
+    return False
+
 async def analyze_l2_image_bytes(raw_image_bytes: bytes) -> L2Snapshot:
-    """Extract a *snapshot* of the ladder/L2 visible in the screenshot."""
+    """Extract a snapshot of the ladder/L2 visible in the screenshot."""
     client = AsyncOpenAI()
     png = preprocess_to_png_bytes(raw_image_bytes)
     data_url = _to_data_url_png(png)
@@ -101,6 +108,9 @@ async def analyze_l2_image_bytes(raw_image_bytes: bytes) -> L2Snapshot:
         bids=bids,
         asks=asks,
     )
+
+    if snap.ladder_visible and not _has_meaningful_l2(snap):
+        snap.ladder_visible = False
 
     snap.bid_sum = _sum_sizes(bids[:5])
     snap.ask_sum = _sum_sizes(asks[:5])
@@ -151,6 +161,9 @@ def build_l2_commentary(a: L2Snapshot | None, b: L2Snapshot | None, d: L2Delta |
     if not a or not a.ladder_visible:
         return "Level two ladder not visible."
 
+    if b is not None and not b.ladder_visible:
+        return "Level two ladder not visible."
+
     if not b or not d:
         if a.imbalance is None:
             return "Level two snapshot captured."
@@ -167,8 +180,7 @@ def build_l2_commentary(a: L2Snapshot | None, b: L2Snapshot | None, d: L2Delta |
             lines.append("Bids strengthening.")
         elif d.imbalance_change < -0.05:
             lines.append("Asks strengthening.")
-        else:
-            lines.append("Order book roughly steady.")
+        # else: say nothing (no more 'roughly steady')
 
     if (d.ask_pull_count or 0) >= 2 and (d.bid_add_count or 0) >= 1:
         lines.append("Asks thinning while bids add.")
