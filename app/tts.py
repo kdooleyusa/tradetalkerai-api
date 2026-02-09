@@ -9,6 +9,16 @@ from openai import AsyncOpenAI
 
 _SAFE_ID_RE = re.compile(r"[^a-zA-Z0-9_\-]+")
 
+# Voice map (1..6)
+VOICE_MAP = {
+    1: "onyx",   # M (default)
+    2: "alloy",  # M
+    3: "verse",  # M
+    4: "echo",   # M
+    5: "nova",   # F
+    6: "marin",  # F
+}
+
 
 def _safe_id(s: str) -> str:
     s = (s or "").strip()
@@ -30,6 +40,19 @@ def _response_to_bytes(resp) -> bytes:
         raise RuntimeError("Could not extract audio bytes from TTS response.")
 
 
+def _resolve_voice(voice_id: int | None) -> str:
+    env_voice = os.getenv("TTS_VOICE")
+    if env_voice:
+        return env_voice
+
+    try:
+        vid = int(voice_id or 1)
+    except Exception:
+        vid = 1
+
+    return VOICE_MAP.get(vid, VOICE_MAP[1])
+
+
 async def generate_tts_mp3(
     *,
     transcript: str,
@@ -37,11 +60,19 @@ async def generate_tts_mp3(
     out_dir: Path,
     model: str | None = None,
     speed: float | None = None,
+    voice: int | None = None,
 ) -> Tuple[Path, str]:
     """Generate MP3 TTS audio and save it locally.
 
-    Harold voice is forced to a male voice for now.
+    voice: integer 1..6
+      1 onyx (default)
+      2 alloy
+      3 verse
+      4 echo
+      5 nova
+      6 marin
     """
+
     if not transcript or not transcript.strip():
         raise ValueError("transcript is empty")
 
@@ -55,21 +86,15 @@ async def generate_tts_mp3(
 
     client = AsyncOpenAI()
 
-    # voice = "onyx"  # M
-    # voice = "alloy"  # M
-    # voice = "verse"  # M
-    # voice = "echo"  # M
-    # voice = "nova"  # F
-    voice = "marin"  # F
-    
-    
+    voice_name = _resolve_voice(voice)
 
     kwargs = {
         "model": model,
-        "voice": voice,
+        "voice": voice_name,
         "input": transcript,
         "response_format": "mp3",
     }
+
     if speed is not None and speed > 0:
         kwargs["speed"] = speed
 
