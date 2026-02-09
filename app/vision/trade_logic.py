@@ -227,67 +227,106 @@ def _fmt_levels(label: str, levels: list[float] | None) -> str | None:
     return f"{label} {middle}, then {last}."
 
 
+def _fmt(x: Optional[float]) -> Optional[str]:
+    if x is None:
+        return None
+    s = f"{x:.2f}".rstrip("0").rstrip(".")
+    return s
+
+
+def _short_l2(l2_comment: Optional[str]) -> Optional[str]:
+    """Only keep high-signal L2 phrases. Drop filler."""
+    if not l2_comment:
+        return None
+    low = l2_comment.lower()
+
+    keep = (
+        "asks strengthening",
+        "bids strengthening",
+        "asks thinning",
+        "bids thinning",
+        "bids add",
+        "asks add",
+        "asks pulling",
+        "bids pulling",
+        "bids stacked",
+        "asks stacked",
+    )
+    if any(k in low for k in keep):
+        return l2_comment.strip().rstrip(".") + "."
+    return None
+
+
 def build_trade_transcript(
     facts: ChartFacts,
     plan: TradePlan,
     l2_comment: str | None = None,
     mode: str = "brief",
 ) -> str:
+    """
+    Ultra-Short (Mode A):
+      brief: one line, ~12 words (hard capped)
+      momentum: brief + trigger/invalidate (still short)
+      full: short plan + one reason + optional strong L2
+    """
+    symbol = (facts.symbol or "Chart").strip()
+    setup = (facts.setup or "unclear").strip()
+
+    # Not readable -> move on
     if facts.confidence < 0.55 or not facts.symbol or not facts.timeframe:
-        return "I can’t read this chart clearly enough. Keep looking."
+        return f"{symbol}. Unclear. Move on."
 
-    parts: list[str] = []
-    parts.append(f"{facts.symbol} on {facts.timeframe}. Price {facts.last_price}.")
-    parts.append(
-        f"VWAP {facts.vwap if facts.vwap is not None else 'not visible'}, "
-        f"EMA9 {facts.ema9 if facts.ema9 is not None else 'n/a'}, "
-        f"EMA21 {facts.ema21 if facts.ema21 is not None else 'n/a'}."
-    )
+    l2 = _short_l2(l2_comment)
 
-    sup = _fmt_levels("Support", facts.support)
-    res = _fmt_levels("Resistance", facts.resistance)
-    if sup:
-        parts.append(sup)
-    if res:
-        parts.append(res)
+    # Step-aside/no-trade -> move on (ultra short)
+    if plan.side in (None, "none") or plan.step_aside:
+        out = f"{symbol}. {setup}. Move on."
+        if mode != "brief" and plan.step_aside:
+            out = f"{symbol}. {setup}. {plan.step_aside[0].rstrip('.')}. Move on."
+        if l2:
+            out = out.rstrip(".") + ". " + l2
+        return out[:180].rstrip()
 
-    parts.append(f"Setup: {facts.setup or 'unclear'}.")
+    entry = _fmt(plan.entry)
+    stop = _fmt(plan.stop)
+    t1 = _fmt(plan.targets[0]) if plan.targets else None
 
+    # ---- BRIEF ----
     if mode == "brief":
-        out = " ".join(parts[:5])
-        if l2_comment:
-            out += " " + l2_comment
-        return out
+        bits = [f"{symbol}.", f"{setup}."]
+        if entry and stop and t1:
+            bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
+        elif entry and stop:
+            bits.append(f"Entry {entry}, stop {stop}.")
+        else:
+            bits.append("Move on.")
+        if l2:
+            bits.append(l2)
+        return " ".join(bits)[:140].rstrip()
 
+    # ---- MOMENTUM ----
     if mode == "momentum":
-        if plan.side != "none" and plan.entry and plan.stop:
-            parts.append(f"Trigger above {_fmt_level(plan.entry)}. Invalidate below {_fmt_level(plan.stop)}.")
-        if l2_comment:
-            parts.append(l2_comment)
-        parts.append("Momentum focus: hold above VWAP; watch the next resistance break and avoid chasing into stacked asks.")
-        return " ".join(parts)
+        bits = [f"{symbol}.", f"{setup}."]
+        if entry and stop and t1:
+            bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
+        if entry and stop:
+            bits.append(f"Trigger {entry}. Invalidate {stop}.")
+        if l2:
+            bits.append(l2)
+        return " ".join(bits)[:200].rstrip()
 
-    # full
-    if plan.side == "none" or not plan.entry or not plan.stop:
-        parts.append("No clean plan. Keep looking.")
-        if l2_comment:
-            parts.append(l2_comment)
-        return " ".join(parts)
+    # ---- FULL (still short) ----
+    bits = [f"{symbol}.", f"{setup}."]
 
-    t_text = ", ".join(_fmt_level(t) for t in (plan.targets[:2] if plan.targets else []))
-    if t_text:
-        parts.append(f"Plan: entry {_fmt_level(plan.entry)}, stop {_fmt_level(plan.stop)}, targets {t_text}.")
-    else:
-        parts.append(f"Plan: entry {_fmt_level(plan.entry)}, stop {_fmt_level(plan.stop)}.")
+    if entry and stop and t1:
+        bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
+    elif entry and stop:
+        bits.append(f"Entry {entry}, stop {stop}.")
 
-    if plan.rr is not None:
-        parts.append(f"Estimated RR {plan.rr}.")
-    parts.append(f"Setup quality {plan.quality}.")
+    if plan.rationale:
+        bits.append(plan.rationale[0].rstrip(".") + ".")
 
-    if plan.step_aside:
-        parts.append("Step aside if: " + "; ".join(plan.step_aside[:3]) + ".")
+    if l2:
+        bits.append(l2)
 
-    if l2_comment:
-        parts.append(l2_comment)
-
-    return " ".join(parts)
+    return " ".join(bits)[:280].rstrip()
