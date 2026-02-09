@@ -70,7 +70,7 @@ async def analyze(
             speed_f = None
 
     
-    # Validate voice id 
+    # Validate voice id
     try:
         voice = int(voice)
     except Exception:
@@ -78,7 +78,7 @@ async def analyze(
     if voice < 1 or voice > 6:
         raise HTTPException(status_code=400, detail="voice must be in range 1..6")
 
-analysis_id = f"chart_{uuid.uuid4().hex[:8]}"
+    analysis_id = f"chart_{uuid.uuid4().hex[:8]}"
 
     saved = {"image": None, "image2": None}
     if save_chart:
