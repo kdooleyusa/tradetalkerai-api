@@ -1,229 +1,293 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Optional, Literal, Tuple
+from typing import Optional
 
-from pydantic import BaseModel, Field
-
-# Import your existing ChartFacts model
-from .schema import ChartFacts
+from .schema import ChartFacts, L2Snapshot, L2Delta, TradePlan
 
 
-SetupQuality = Literal["A", "B", "C", "D", "F"]
-BiasType = Literal["long", "none"]
+def _buffer(price: Optional[float]) -> float:
+    """Small adaptive buffer to avoid exact-touch entries/stops."""
+    if not price or price <= 0:
+        return 0.01
+    return max(0.01, price * 0.0001)  # 1 bp or 1 cent, whichever larger
 
 
-class TradePlan(BaseModel):
-    """
-    A lightweight, deterministic trade plan derived from ChartFacts.
-    Designed to be safe: if we can't compute a reasonable plan, we step aside.
-    """
-    bias: BiasType = "none"
-
-    entry: Optional[float] = None
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-
-    rr: Optional[float] = None  # reward/risk
-    setup_quality: SetupQuality = "F"
-    step_aside: bool = True
-
-    reasons: List[str] = Field(default_factory=list)
-
-
-def _as_sorted_unique(vals: List[float]) -> List[float]:
-    out = []
-    for v in vals or []:
-        try:
-            fv = float(v)
-        except Exception:
-            continue
-        if fv not in out:
-            out.append(fv)
-    out.sort()
-    return out
-
-
-def _nearest_below(levels: List[float], x: float) -> Optional[float]:
-    below = [v for v in levels if v < x]
+def _nearest_below(levels: list[float], x: float) -> Optional[float]:
+    below = [v for v in levels if v <= x]
     return max(below) if below else None
 
 
-def _nearest_above(levels: List[float], x: float) -> Optional[float]:
-    above = [v for v in levels if v > x]
+def _nearest_above(levels: list[float], x: float) -> Optional[float]:
+    above = [v for v in levels if v >= x]
     return min(above) if above else None
 
 
-def _round_price(p: Optional[float]) -> Optional[float]:
-    if p is None:
-        return None
-    # Keep it human-friendly; Webull is usually 2 decimals for most stocks.
-    return round(float(p), 2)
-
-
-def _compute_rr(entry: float, stop: float, target: float) -> Optional[float]:
-    risk = abs(entry - stop)
-    reward = abs(target - entry)
+def _rr(entry: float, stop: float, target: float) -> Optional[float]:
+    risk = entry - stop
     if risk <= 0:
+        return None
+    reward = target - entry
+    if reward <= 0:
         return None
     return reward / risk
 
 
-def _grade(rr: Optional[float], confidence: float) -> SetupQuality:
-    """
-    Conservative grading:
-    - Confidence gates the grade ceiling.
-    - RR gates the base grade.
-    """
-    if rr is None:
-        return "F"
-
-    # RR-based base grade
-    if rr >= 3.0:
-        base = "A"
-    elif rr >= 2.0:
-        base = "B"
-    elif rr >= 1.4:
-        base = "C"
-    elif rr >= 1.0:
-        base = "D"
-    else:
-        base = "F"
-
-    # Confidence ceiling
+def _quality_from(rr_val: Optional[float], confidence: float, l2_score: float) -> str:
     if confidence < 0.55:
         return "F"
-    if confidence < 0.70 and base == "A":
-        return "B"
-    if confidence < 0.70 and base == "B":
-        return "C"
-    if confidence < 0.80 and base == "A":
-        return "A"  # allow A only above 0.8
-    return base
+
+    rr_base = rr_val or 0.0
+    if rr_base >= 3.0:
+        q = "A"
+    elif rr_base >= 2.2:
+        q = "B"
+    elif rr_base >= 1.6:
+        q = "C"
+    elif rr_base >= 1.2:
+        q = "D"
+    else:
+        q = "F"
+
+    # Nudge by confidence and L2
+    if confidence >= 0.9 and q in ("B", "C"):
+        q = "A" if q == "B" else "B"
+    if l2_score <= -0.35 and q in ("A", "B", "C"):
+        q = "B" if q == "A" else ("C" if q == "B" else "D")
+    if l2_score >= 0.35 and q in ("C", "D"):
+        q = "B" if q == "C" else "C"
+    return q
 
 
-def compute_trade_plan(f: ChartFacts, mode: str = "brief") -> TradePlan:
-    """
-    Deterministic plan based on extracted chart facts.
-    Bullish-only for now (matches your "keep looking" / step-aside style).
-    """
-    plan = TradePlan()
-    support = _as_sorted_unique(f.support)
-    resistance = _as_sorted_unique(f.resistance)
+def _l2_score(l2_a: Optional[L2Snapshot], l2_b: Optional[L2Snapshot], delta: Optional[L2Delta]) -> float:
+    """Convert L2 into a simple -1..+1 score."""
+    if not l2_a or not l2_a.ladder_visible:
+        return 0.0
 
-    # Basic safety checks
-    if f.confidence < 0.55 or not f.symbol or not f.timeframe or f.last_price is None:
-        plan.reasons.append("Low confidence or missing basics (symbol/timeframe/price).")
+    score = 0.0
+
+    imb_a = l2_a.imbalance
+    if imb_a is not None:
+        score += (imb_a - 0.5) * 1.2
+
+    if l2_b and l2_b.imbalance is not None and imb_a is not None:
+        score += (l2_b.imbalance - imb_a) * 1.5
+
+    if delta:
+        score += (delta.bid_add_count - delta.bid_pull_count) * 0.05
+        score -= (delta.ask_add_count - delta.ask_pull_count) * 0.05
+        if delta.imbalance_change is not None:
+            score += delta.imbalance_change * 1.5
+
+    return max(-1.0, min(1.0, score))
+
+
+def build_trade_plan(
+    facts: ChartFacts,
+    l2_frame1: Optional[L2Snapshot] = None,
+    l2_frame2: Optional[L2Snapshot] = None,
+    l2_delta: Optional[L2Delta] = None,
+) -> TradePlan:
+    """Bullish-only v1 plan generator."""
+    plan = TradePlan(side="none")
+
+    if facts.confidence < 0.55 or not facts.symbol or not facts.timeframe or facts.setup in (None, "unclear"):
+        plan.step_aside.append("Low confidence or unclear setup")
+        plan.rationale.append("Vision couldn't confidently read symbol/timeframe/setup")
         return plan
 
-    last = float(f.last_price)
-    plan.bias = "long"
+    price = facts.last_price
+    if price is None:
+        plan.step_aside.append("Missing last_price")
+        plan.rationale.append("No readable last_price on screenshot")
+        return plan
 
-    # Helper anchors
-    vwap = f.vwap
-    ema9 = f.ema9
-    ema21 = f.ema21
+    buf = _buffer(price)
+    l2s = _l2_score(l2_frame1, l2_frame2, l2_delta)
 
-    sup = _nearest_below(support, last) or _nearest_below(support, vwap or last) or _nearest_below(support, ema9 or last)
-    res = _nearest_above(resistance, last) or _nearest_above(resistance, vwap or last) or _nearest_above(resistance, ema9 or last)
+    support = sorted(set([float(x) for x in (facts.support or [])]))
+    resistance = sorted(set([float(x) for x in (facts.resistance or [])]))
 
-    setup = (f.setup or "unclear").lower().strip()
+    vwap = facts.vwap
+    ema9 = facts.ema9
+    ema21 = facts.ema21
+    ma_stack = [x for x in [vwap, ema9, ema21] if x is not None]
+    ma_mid = sum(ma_stack) / len(ma_stack) if ma_stack else None
 
-    # --- Setup-specific heuristics ---
-    if setup == "pullback":
-        # Prefer entry near VWAP/EMA9 if present
-        entry = vwap or ema9 or last
-        stop = sup if sup is not None else entry * 0.995  # 0.5% default
-        target = res if res is not None else entry * 1.01  # 1% default
-        plan.reasons.append("Pullback: entry near VWAP/EMA9, stop under nearest support, target at nearest resistance.")
+    setup = facts.setup or "unclear"
 
-    elif setup == "breakout":
-        # Entry at (or just above) nearest resistance, if visible
-        entry = res if res is not None else last
-        # Stop at VWAP/EMA9 (whichever is lower) or slightly below entry
-        anchor = None
-        for a in (vwap, ema9, ema21):
-            if a is not None:
-                anchor = float(a) if anchor is None else min(anchor, float(a))
-        stop = anchor if anchor is not None else entry * 0.99
-        # Target: next resistance above entry if available, else 2R target
-        next_res = _nearest_above(resistance, entry)  # since resistance is sorted
-        if next_res is not None:
-            target = next_res
-            plan.reasons.append("Breakout: entry at resistance, target at next resistance.")
-        else:
-            rr2_target = entry + abs(entry - stop) * 2.0
-            target = rr2_target
-            plan.reasons.append("Breakout: entry at resistance, target set to 2R (no next resistance visible).")
-        plan.reasons.append("Stop anchored to VWAP/EMA levels when visible.")
+    plan.side = "long"
+    plan.rationale.append(f"Setup={setup}, confidence={facts.confidence:.2f}, l2_score={l2s:+.2f}")
 
-    elif setup == "range":
-        # Bullish-only range: buy support, sell to mid/upper range
-        if sup is None or res is None:
-            plan.reasons.append("Range: missing clear support/resistance.")
-            return plan
-        entry = sup
-        stop = sup * 0.995
-        target = res
-        plan.reasons.append("Range: bullish bounce off support to resistance.")
+    if setup == "breakout":
+        trigger = _nearest_above(resistance, price) or price
+        plan.entry = trigger + buf
+        stop_ref = _nearest_below(support, price) or (ma_mid if ma_mid is not None else price - (buf * 5))
+        plan.stop = stop_ref - buf
+
+        t1 = _nearest_above(resistance, plan.entry + buf)
+        if t1 is not None:
+            plan.targets.append(t1)
+            t2 = _nearest_above(resistance, t1 + buf)
+            if t2 is not None:
+                plan.targets.append(t2)
+        if not plan.targets:
+            risk = plan.entry - plan.stop
+            plan.targets = [plan.entry + risk * 1.5, plan.entry + risk * 2.5]
+
+        plan.rationale.append("Breakout: entry over resistance, stop under support/MA, targets to next resistance.")
+
+    elif setup == "pullback":
+        reclaim = (ma_mid + buf) if ma_mid is not None else None
+        first_res = _nearest_above(resistance, price)
+        plan.entry = reclaim if reclaim is not None else (first_res + buf if first_res is not None else price + buf)
+
+        stop_ref = _nearest_below(support, price)
+        if stop_ref is None and vwap is not None:
+            stop_ref = vwap
+        if stop_ref is None:
+            stop_ref = price - (buf * 6)
+        plan.stop = stop_ref - buf
+
+        t1 = _nearest_above(resistance, plan.entry + buf)
+        if t1 is not None:
+            plan.targets.append(t1)
+            t2 = _nearest_above(resistance, t1 + buf)
+            if t2 is not None:
+                plan.targets.append(t2)
+        if not plan.targets:
+            risk = plan.entry - plan.stop
+            plan.targets = [plan.entry + risk * 1.2, plan.entry + risk * 2.0]
+
+        plan.rationale.append("Pullback: entry on reclaim, stop under support/VWAP, targets at resistance.")
 
     elif setup == "failed breakout":
-        # Bullish-only engine: step aside
-        plan.reasons.append("Failed breakout: step aside (bullish-only).")
+        plan.step_aside.append("Failed breakout (bullish-only) — need reclaim confirmation")
+        plan.rationale.append("Bullish-only engine: skipping until reclaim + bid support is clear.")
+        trigger = (vwap if vwap is not None else ma_mid)
+        if trigger is not None:
+            plan.entry = trigger + buf
+            stop_ref = _nearest_below(support, trigger) or (trigger - buf * 6)
+            plan.stop = stop_ref - buf
+            t1 = _nearest_above(resistance, plan.entry + buf)
+            if t1 is not None:
+                plan.targets.append(t1)
+        return plan
+
+    elif setup == "range":
+        plan.step_aside.append("Range setup — needs clean break or defined mean-reversion rules")
+        plan.rationale.append("Range is ambiguous for this breakout/pullback engine.")
+        hi = max(resistance) if resistance else None
+        lo = min(support) if support else None
+        if hi is not None:
+            plan.entry = hi + buf
+            plan.stop = (lo - buf) if lo is not None else (hi - buf * 8)
+            plan.targets = [hi + (hi - (lo or (hi - buf * 8))) * 1.2]
         return plan
 
     else:
-        # Unclear: step aside unless RR is excellent and levels are clear
-        plan.reasons.append("Unclear setup: default step aside unless plan quality is strong.")
-        entry = vwap or ema9 or last
-        stop = sup if sup is not None else entry * 0.995
-        target = res if res is not None else entry * 1.01
-
-    # Normalize
-    entry = float(entry)
-    stop = float(stop)
-    target = float(target)
-
-    # Sanity: long trade must have stop < entry < target
-    if not (stop < entry < target):
-        plan.reasons.append("Sanity check failed: stop/entry/target not in bullish order.")
+        plan.step_aside.append("Unclear setup")
         return plan
 
-    rr = _compute_rr(entry, stop, target)
-    qual = _grade(rr, float(f.confidence))
-
-    plan.entry = _round_price(entry)
-    plan.stop_loss = _round_price(stop)
-    plan.take_profit = _round_price(target)
-    plan.rr = round(rr, 2) if rr is not None else None
-    plan.setup_quality = qual
-
-    # Step-aside policy:
-    # - Always step aside for D/F
-    # - For C, allow only if mode != brief (i.e., "full" might still show it)
-    if qual in ("A", "B"):
-        plan.step_aside = False
-    elif qual == "C":
-        plan.step_aside = (mode == "brief")
-        if plan.step_aside:
-            plan.reasons.append("Quality C: brief mode steps aside; use full to see marginal setups.")
+    if plan.entry is not None and plan.stop is not None and plan.targets:
+        rr_val = _rr(plan.entry, plan.stop, plan.targets[0])
+        plan.rr = round(rr_val, 2) if rr_val is not None else None
     else:
-        plan.step_aside = True
+        plan.rr = None
 
+    plan.quality = _quality_from(plan.rr, facts.confidence, l2s)  # type: ignore
+
+    if plan.rr is not None and plan.rr < 1.5:
+        plan.step_aside.append("RR too low (< 1.5)")
+    if facts.confidence < 0.75:
+        plan.step_aside.append("Chart read confidence moderate — consider closer screenshot")
+    if l2_frame1 and l2_frame1.ladder_visible:
+        if l2s <= -0.35:
+            plan.step_aside.append("L2 pressure bearish (bid pull / ask add)")
+        elif l2s >= 0.35:
+            plan.rationale.append("L2 supportive (bid add / ask pull)")
+
+    plan.targets = sorted(set([round(float(t), 4) for t in plan.targets]))
     return plan
 
 
-def plan_to_transcript(f: ChartFacts, plan: TradePlan) -> str:
-    """
-    Converts plan into a spoken summary.
-    Keep it compact and trader-friendly.
-    """
-    if plan.step_aside or plan.bias == "none" or plan.entry is None:
-        return "Step aside. Keep looking."
+def _fmt_level(x: float) -> str:
+    return f"{x:.2f}".rstrip("0").rstrip(".")
 
-    bits = []
-    bits.append(f"Entry {plan.entry}. Stop {plan.stop_loss}. Target {plan.take_profit}.")
+
+def _fmt_levels(label: str, levels: list[float] | None) -> str | None:
+    if not levels:
+        return None
+    shown = levels[:4]
+    if len(shown) == 1:
+        return f"{label} {_fmt_level(shown[0])}."
+    if len(shown) == 2:
+        return f"{label} {_fmt_level(shown[0])} then {_fmt_level(shown[1])}."
+    middle = ", ".join(_fmt_level(v) for v in shown[:-1])
+    last = _fmt_level(shown[-1])
+    return f"{label} {middle}, then {last}."
+
+
+def build_trade_transcript(
+    facts: ChartFacts,
+    plan: TradePlan,
+    l2_comment: str | None = None,
+    mode: str = "brief",
+) -> str:
+    if facts.confidence < 0.55 or not facts.symbol or not facts.timeframe:
+        return "I can’t read this chart clearly enough. Keep looking."
+
+    parts: list[str] = []
+    parts.append(f"{facts.symbol} on {facts.timeframe}. Price {facts.last_price}.")
+    parts.append(
+        f"VWAP {facts.vwap if facts.vwap is not None else 'not visible'}, "
+        f"EMA9 {facts.ema9 if facts.ema9 is not None else 'n/a'}, "
+        f"EMA21 {facts.ema21 if facts.ema21 is not None else 'n/a'}."
+    )
+
+    sup = _fmt_levels("Support", facts.support)
+    res = _fmt_levels("Resistance", facts.resistance)
+    if sup:
+        parts.append(sup)
+    if res:
+        parts.append(res)
+
+    parts.append(f"Setup: {facts.setup or 'unclear'}.")
+
+    if mode == "brief":
+        out = " ".join(parts[:5])
+        if l2_comment:
+            out += " " + l2_comment
+        return out
+
+    if mode == "momentum":
+        if plan.side != "none" and plan.entry and plan.stop:
+            parts.append(f"Trigger above {_fmt_level(plan.entry)}. Invalidate below {_fmt_level(plan.stop)}.")
+        if l2_comment:
+            parts.append(l2_comment)
+        parts.append("Momentum focus: hold above VWAP; watch the next resistance break and avoid chasing into stacked asks.")
+        return " ".join(parts)
+
+    # full
+    if plan.side == "none" or not plan.entry or not plan.stop:
+        parts.append("No clean plan. Keep looking.")
+        if l2_comment:
+            parts.append(l2_comment)
+        return " ".join(parts)
+
+    t_text = ", ".join(_fmt_level(t) for t in (plan.targets[:2] if plan.targets else []))
+    if t_text:
+        parts.append(f"Plan: entry {_fmt_level(plan.entry)}, stop {_fmt_level(plan.stop)}, targets {t_text}.")
+    else:
+        parts.append(f"Plan: entry {_fmt_level(plan.entry)}, stop {_fmt_level(plan.stop)}.")
+
     if plan.rr is not None:
-        bits.append(f"R R {plan.rr}.")
-    bits.append(f"Setup quality {plan.setup_quality}.")
-    return " ".join(bits)
+        parts.append(f"Estimated RR {plan.rr}.")
+    parts.append(f"Setup quality {plan.quality}.")
+
+    if plan.step_aside:
+        parts.append("Step aside if: " + "; ".join(plan.step_aside[:3]) + ".")
+
+    if l2_comment:
+        parts.append(l2_comment)
+
+    return " ".join(parts)
