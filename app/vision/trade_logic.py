@@ -257,6 +257,50 @@ def _short_l2(l2_comment: Optional[str]) -> Optional[str]:
     return None
 
 
+def _confidence_adj(conf: float | None) -> str:
+    if conf is None:
+        return "unknown-confidence"
+    if conf >= 0.85:
+        return "high-confidence"
+    if conf >= 0.70:
+        return "medium-confidence"
+    if conf >= 0.55:
+        return "low-confidence"
+    return "very-low-confidence"
+
+
+def _sentiment_word(setup: str | None, side: str | None, l2_comment: Optional[str]) -> str:
+    # tiny, scanner-style words
+    setup = (setup or "unclear").lower().strip()
+    side = (side or "none").lower().strip()
+
+    if setup == "range":
+        return "choppy"
+    if setup == "breakout":
+        return "hot"
+    if setup == "pullback":
+        return "reset"
+    if setup == "failed breakout":
+        return "rejecting"
+    # If L2 is strong, let it influence a tiny sentiment
+    if l2_comment:
+        low = l2_comment.lower()
+        if "asks strengthening" in low or "asks stacked" in low:
+            return "heavy"
+        if "bids strengthening" in low or "bids stacked" in low:
+            return "supported"
+        if "asks thinning" in low:
+            return "lifting"
+        if "bids thinning" in low:
+            return "soft"
+    # fallback based on side
+    if side == "long":
+        return "bullish"
+    if side == "short":
+        return "bearish"
+    return "foggy"
+
+
 def build_trade_transcript(
     facts: ChartFacts,
     plan: TradePlan,
@@ -264,28 +308,40 @@ def build_trade_transcript(
     mode: str = "brief",
 ) -> str:
     """
-    Ultra-Short (Mode A):
-      brief: one line, ~12 words (hard capped)
-      momentum: brief + trigger/invalidate (still short)
-      full: short plan + one reason + optional strong L2
+    Mode A+ (Ultra-short screener voice, slightly richer):
+      - Adds confidence adjective + tiny sentiment word
+      - Unclear path: "SYMBOL high-confidence. Price X. choppy. Position unclear because ... Move on."
+      - Actionable path stays short: entry/stop/target in one line
     """
     symbol = (facts.symbol or "Chart").strip()
     setup = (facts.setup or "unclear").strip()
-
-    # Not readable -> move on
-    if facts.confidence < 0.55 or not facts.symbol or not facts.timeframe:
-        return f"{symbol}. Unclear. Move on."
-
+    adj = _confidence_adj(facts.confidence)
+    price = _fmt(facts.last_price) or "?"
     l2 = _short_l2(l2_comment)
+    senti = _sentiment_word(setup, plan.side, l2)
+
+    # ---- Unclear / move-on gates ----
+    if facts.confidence is None or facts.confidence < 0.55:
+        return f"{symbol} {adj}. Price {price}. {senti}. Position unclear because low confidence read. Move on."
+
+    if not facts.symbol or not facts.timeframe:
+        return f"{symbol} {adj}. Price {price}. {senti}. Position unclear because symbol or timeframe missing. Move on."
+
+    if setup.lower() == "unclear":
+        return f"{symbol} {adj}. Price {price}. {senti}. Position unclear because setup not confirmed. Move on."
 
     # Step-aside/no-trade -> move on (ultra short)
     if plan.side in (None, "none") or plan.step_aside:
-        out = f"{symbol}. {setup}. Move on."
-        if mode != "brief" and plan.step_aside:
-            out = f"{symbol}. {setup}. {plan.step_aside[0].rstrip('.')}. Move on."
+        reason = None
+        if plan.step_aside:
+            reason = plan.step_aside[0].rstrip(".")
+        if mode == "brief" or not reason:
+            out = f"{symbol} {adj}. Price {price}. {senti}. Move on."
+        else:
+            out = f"{symbol} {adj}. Price {price}. {senti}. {reason}. Move on."
         if l2:
             out = out.rstrip(".") + ". " + l2
-        return out[:180].rstrip()
+        return out[:220].rstrip()
 
     entry = _fmt(plan.entry)
     stop = _fmt(plan.stop)
@@ -293,7 +349,7 @@ def build_trade_transcript(
 
     # ---- BRIEF ----
     if mode == "brief":
-        bits = [f"{symbol}.", f"{setup}."]
+        bits = [f"{symbol} {adj}.", f"Price {price}.", f"{senti}."]
         if entry and stop and t1:
             bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
         elif entry and stop:
@@ -302,31 +358,27 @@ def build_trade_transcript(
             bits.append("Move on.")
         if l2:
             bits.append(l2)
-        return " ".join(bits)[:140].rstrip()
+        return " ".join(bits)[:180].rstrip()
 
     # ---- MOMENTUM ----
     if mode == "momentum":
-        bits = [f"{symbol}.", f"{setup}."]
+        bits = [f"{symbol} {adj}.", f"Price {price}.", f"{senti}."]
         if entry and stop and t1:
             bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
         if entry and stop:
             bits.append(f"Trigger {entry}. Invalidate {stop}.")
         if l2:
             bits.append(l2)
-        return " ".join(bits)[:200].rstrip()
+        return " ".join(bits)[:240].rstrip()
 
     # ---- FULL (still short) ----
-    bits = [f"{symbol}.", f"{setup}."]
-
+    bits = [f"{symbol} {adj}.", f"Price {price}.", f"{senti}."]
     if entry and stop and t1:
         bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
     elif entry and stop:
         bits.append(f"Entry {entry}, stop {stop}.")
-
     if plan.rationale:
         bits.append(plan.rationale[0].rstrip(".") + ".")
-
     if l2:
         bits.append(l2)
-
-    return " ".join(bits)[:280].rstrip()
+    return " ".join(bits)[:320].rstrip()
