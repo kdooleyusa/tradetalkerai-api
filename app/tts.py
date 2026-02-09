@@ -55,7 +55,7 @@ async def generate_tts_mp3(
 
     client = AsyncOpenAI()
 
-    voice = "onyx"  # forced male Harold voice
+    voice = "verse"  # forced male Harold voice
 
     kwargs = {
         "model": model,
