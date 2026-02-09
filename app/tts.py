@@ -56,7 +56,7 @@ async def generate_tts_mp3(
     client = AsyncOpenAI()
 
     # voice = "onyx"  # ED
-     voice = "alloy"  # ED
+    voice = "alloy"  # ED
     # voice = "verse"  # ED
     # voice = "echo"  # ED
     # voice = "nova"  # ED
