@@ -227,81 +227,6 @@ def _fmt_levels(label: str, levels: list[float] | None) -> str | None:
     return f"{label} {middle}, then {last}."
 
 
-def _confidence_adj(conf: float | None) -> str:
-    if conf is None:
-        return "unknown-confidence"
-    if conf >= 0.85:
-        return "high-confidence"
-    if conf >= 0.70:
-        return "medium-confidence"
-    if conf >= 0.55:
-        return "low-confidence"
-    return "very-low-confidence"
-
-
-def _confidence_pct(conf: float | None) -> str:
-    if conf is None:
-        return ""
-    pct = int(round(conf * 100))
-    return f"{pct} percent"
-
-
-def _short_l2(l2_comment: str | None) -> str | None:
-    # Keep only high-signal L2 phrases; drop filler.
-    if not l2_comment:
-        return None
-    low = l2_comment.lower().strip()
-    drop = ("not visible", "timed out", "failed", "captured")
-    if any(d in low for d in drop):
-        return None
-    allow = (
-        "asks strengthening",
-        "bids strengthening",
-        "asks thinning",
-        "bids thinning",
-        "asks pulling",
-        "bids pulling",
-        "asks stacked",
-        "bids stacked",
-        "asks add",
-        "bids add",
-    )
-    if any(a in low for a in allow):
-        return l2_comment.strip().rstrip(".") + "."
-    return None
-
-
-def _sentiment_word(setup: str | None, side: str | None, l2_short: str | None) -> str:
-    setup_l = (setup or "unclear").lower().strip()
-    side_l = (side or "none").lower().strip()
-
-    if setup_l == "range":
-        return "choppy"
-    if setup_l == "breakout":
-        return "hot"
-    if setup_l == "pullback":
-        return "reset"
-    if setup_l == "failed breakout":
-        return "rejecting"
-
-    if l2_short:
-        low = l2_short.lower()
-        if "asks strengthening" in low or "asks stacked" in low:
-            return "heavy"
-        if "bids strengthening" in low or "bids stacked" in low:
-            return "supported"
-        if "asks thinning" in low:
-            return "lifting"
-        if "bids thinning" in low:
-            return "soft"
-
-    if side_l == "long":
-        return "bullish"
-    if side_l == "short":
-        return "bearish"
-    return "foggy"
-
-
 def _mode_norm(mode: str | None) -> str:
     m = (mode or "brief").strip().lower()
     if m in ("momo", "momentum", "mom"):
@@ -319,84 +244,74 @@ def build_trade_transcript(
     l2_comment: str | None = None,
     mode: str = "brief",
 ) -> str:
+    """Professional screener voice.
+    Uses setup quality (A/B/C/D/F). No sentiment words or numeric confidence.
     """
-    Screener voice:
-      - No internal tokens like 'setup=', 'confidence=', 'l2_score='
-      - Confidence spoken as adjective; percent only in full mode
-      - Quality spoken as 'A quality', 'B quality', etc.
-      - Mode alias: 'momo' treated as momentum
-    """
+
     mode = _mode_norm(mode)
 
     symbol = (facts.symbol or "Chart").strip()
-    setup = (facts.setup or "unclear").strip()
-    adj = _confidence_adj(facts.confidence)
-    pct = _confidence_pct(facts.confidence)
+    setup = (facts.setup or "unclear").strip().lower()
     price = _fmt_level(facts.last_price) if facts.last_price is not None else "?"
-    l2_short = _short_l2(l2_comment)
-    senti = _sentiment_word(setup, plan.side, l2_short)
 
-    # ---- Unclear / move-on gates ----
-    if facts.confidence is None or facts.confidence < 0.55:
-        return f"{symbol} {adj}. Price {price}. {senti}. Position unclear because low confidence read. Move on."
+    quality = (plan.quality or "C").upper()
+    quality_spoken = f"{quality} quality"
 
-    if not facts.symbol or not facts.timeframe:
-        return f"{symbol} {adj}. Price {price}. {senti}. Position unclear because symbol or timeframe missing. Move on."
+    # ---- HARD MOVE ON ----
+    if (
+        facts.confidence is None
+        or facts.confidence < 0.55
+        or setup in ("unclear", "range")
+        or plan.side in (None, "none")
+        or plan.quality in ("D", "F")
+        or plan.step_aside
+    ):
+        reason = None
+        if plan.step_aside:
+            reason = plan.step_aside[0].rstrip(".")
+        elif plan.rationale:
+            reason = plan.rationale[0].rstrip(".")
 
-    if setup.lower() == "unclear":
-        return f"{symbol} {adj}. Price {price}. {senti}. Position unclear because setup not confirmed. Move on."
+        if mode == "brief":
+            return f"{symbol}. Price {price}. Move on."
 
-    # Step-aside/no-trade -> move on
-    if plan.side in (None, "none") or plan.step_aside:
-        reason = plan.step_aside[0].rstrip(".") if plan.step_aside else None
-        if mode == "brief" or not reason:
-            out = f"{symbol} {adj}. Price {price}. {senti}. Move on."
-        else:
-            out = f"{symbol} {adj}. Price {price}. {senti}. {reason}. Move on."
-        if l2_short:
-            out = out.rstrip(".") + ". " + l2_short
-        return out[:240].rstrip()
+        if mode == "momentum":
+            if reason:
+                return f"{symbol}. Price {price}. {reason}. Move on."
+            return f"{symbol}. Price {price}. Move on."
 
-    # Actionable
+        if reason:
+            return f"{symbol}. Price {price}. {reason}. Move on."
+        return f"{symbol}. Price {price}. Move on."
+
     entry = _fmt_level(plan.entry) if plan.entry is not None else None
     stop = _fmt_level(plan.stop) if plan.stop is not None else None
     t1 = _fmt_level(plan.targets[0]) if getattr(plan, "targets", None) else None
 
-    q = (plan.quality or "C").strip().upper()
-    q_spoken = f"{q} quality"
-
     if mode == "brief":
-        bits = [f"{symbol} {adj}.", f"Price {price}.", f"{senti}.", q_spoken + "."]
+        bits = [f"{symbol}.", quality_spoken + "."]
         if entry and stop and t1:
             bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
         elif entry and stop:
             bits.append(f"Entry {entry}, stop {stop}.")
-        if l2_short:
-            bits.append(l2_short)
-        return " ".join(bits)[:210].rstrip()
+        return " ".join(bits)
 
     if mode == "momentum":
-        bits = [f"{symbol} {adj}.", f"Price {price}.", f"{senti}.", q_spoken + "."]
+        bits = [f"{symbol}.", quality_spoken + "."]
         if entry and stop and t1:
             bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
         if entry and stop:
             bits.append(f"Trigger {entry}. Invalidate {stop}.")
-        if l2_short:
-            bits.append(l2_short)
-        return " ".join(bits)[:270].rstrip()
+        return " ".join(bits)
 
-    # full
-    bits = [f"{symbol} {adj} ({pct}).", f"Price {price}.", f"{senti}.", q_spoken + "."]
+    bits = [f"{symbol}.", quality_spoken + "."]
     if entry and stop and t1:
         bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
     elif entry and stop:
         bits.append(f"Entry {entry}, stop {stop}.")
-    # Add at most one human rationale line, skipping token-y ones
+
     for r in (plan.rationale or []):
-        if any(tok in r for tok in ("Setup=", "confidence=", "l2_score=")):
-            continue
         bits.append(r.rstrip(".") + ".")
         break
-    if l2_short:
-        bits.append(l2_short)
-    return " ".join(bits)[:340].rstrip()
+
+    return " ".join(bits)
