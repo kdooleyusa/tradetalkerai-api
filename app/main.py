@@ -429,24 +429,24 @@ async def analyze(
     audio_full_url = f"{base}{audio_url}"
 
 
-latency = int((time.perf_counter() - t0) * 1000)
-await _log_usage(
-    request_id=request_id,
-    subscriber_id=subscriber_id,
-    device_id=device_id,
-    endpoint=endpoint,
-    mode=mode,
-    num_images=num_images,
-    image_bytes=image_bytes,
-    payload_bytes=payload_bytes,
-    model=model,
-    prompt_tokens=None,
-    completion_tokens=None,
-    total_tokens=None,
-    api_cost_usd=None,
-    latency_ms=latency,
-    status_code=200,
-)
+    latency = int((time.perf_counter() - t0) * 1000)
+    await _log_usage(
+        request_id=request_id,
+        subscriber_id=subscriber_id,
+        device_id=device_id,
+        endpoint=endpoint,
+        mode=mode,
+        num_images=num_images,
+        image_bytes=image_bytes,
+        payload_bytes=payload_bytes,
+        model=model,
+        prompt_tokens=None,
+        completion_tokens=None,
+        total_tokens=None,
+        api_cost_usd=None,
+        latency_ms=latency,
+        status_code=200,
+    )
     return {
         "mode": mode,
         "voice": voice,
