@@ -11,3 +11,5 @@ pillow==10.4.0
 botocore
 python-dotenv
 asyncpg==0.29.0
+psycopg[binary]
+psycopg-pool
