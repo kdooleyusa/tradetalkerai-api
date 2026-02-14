@@ -10,3 +10,4 @@ boto3==1.35.92
 pillow==10.4.0
 botocore
 python-dotenv
+asyncpg==0.29.0
