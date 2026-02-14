@@ -39,7 +39,7 @@ async def _db_pool() -> AsyncConnectionPool:
         dsn = os.environ.get("DATABASE_URL")
         if not dsn:
             raise RuntimeError("DATABASE_URL is not set")
-        _DB_POOL = AsyncConnectionPool(conninfo=dsn, min_size=1, max_size=5, timeout=5)
+        _DB_POOL = AsyncConnectionPool(conninfo=dsn, min_size=1, max_size=5, timeout=5, kwargs={'autocommit': True})
         await _DB_POOL.open()
     return _DB_POOL
 
@@ -155,6 +155,36 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.get("/v1/entitlement")
+async def entitlement_check(
+    request: Request,
+    x_subscriber_id: str | None = Header(default=None, alias="X-Subscriber-Id"),
+    x_device_id: str | None = Header(default=None, alias="X-Device-Id"),
+):
+    """
+    Lightweight entitlement check (no image upload). Useful for debugging client headers.
+    """
+    request_id = _new_request_id()
+    allowed, reason = await _check_subscriber(x_subscriber_id)
+    await _log_entitlement(
+        request_id=request_id,
+        subscriber_id=x_subscriber_id,
+        device_id=x_device_id,
+        endpoint="/v1/entitlement",
+        decision="ALLOW" if allowed else "DENY",
+        reason=reason,
+        request=request,
+    )
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "subscriber_id": x_subscriber_id,
+        "device_id": x_device_id,
+        "allowed": allowed,
+        "reason": reason,
+    }
+
 
 
 @app.post("/v1/analyze")
@@ -399,24 +429,24 @@ async def analyze(
     audio_full_url = f"{base}{audio_url}"
 
 
-    latency = int((time.perf_counter() - t0) * 1000)
-    await _log_usage(
-        request_id=request_id,
-        subscriber_id=subscriber_id,
-        device_id=device_id,
-        endpoint=endpoint,
-        mode=mode,
-        num_images=num_images,
-        image_bytes=image_bytes,
-        payload_bytes=payload_bytes,
-        model=model,
-        prompt_tokens=None,
-        completion_tokens=None,
-        total_tokens=None,
-        api_cost_usd=None,
-        latency_ms=latency,
-        status_code=200,
-    )
+latency = int((time.perf_counter() - t0) * 1000)
+await _log_usage(
+    request_id=request_id,
+    subscriber_id=subscriber_id,
+    device_id=device_id,
+    endpoint=endpoint,
+    mode=mode,
+    num_images=num_images,
+    image_bytes=image_bytes,
+    payload_bytes=payload_bytes,
+    model=model,
+    prompt_tokens=None,
+    completion_tokens=None,
+    total_tokens=None,
+    api_cost_usd=None,
+    latency_ms=latency,
+    status_code=200,
+)
     return {
         "mode": mode,
         "voice": voice,
@@ -440,4 +470,4 @@ async def analyze(
         "vision_timeout_s": float(os.getenv("VISION_TIMEOUT_SEC", "25")),
         "l2_timeout_s": float(os.getenv("L2_TIMEOUT_SEC", "25")),
         "frame_delay_ms": frame_delay_ms,
-        }
+    }
