@@ -6,10 +6,11 @@ python-multipart==0.0.20
 
 redis==5.2.1
 rq==1.16.2
+
 boto3==1.35.92
 pillow==10.4.0
-botocore
-python-dotenv
-asyncpg==0.29.0
-psycopg[binary]
-psycopg-pool
+python-dotenv==1.2.1
+
+# Postgres (psycopg3). NOTE: Do NOT install asyncpg on Python 3.13.
+psycopg[binary]==3.3.2
+psycopg-pool==3.3.0
