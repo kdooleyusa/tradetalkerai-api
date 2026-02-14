@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from pathlib import Path
 import time
 import secrets
+from psycopg_pool import AsyncConnectionPool
 
-import asyncpg
-from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -19,85 +19,103 @@ from vision.trade_logic import build_trade_plan, build_trade_transcript
 
 app = FastAPI(title="TradeTalkerAI API")
 
-_DB_POOL = None
 
-async def db_pool():
+# --- Subscriber gate + usage logging (Postgres) ---
+_DB_POOL: AsyncConnectionPool | None = None
+
+def _get_pool() -> AsyncConnectionPool:
     global _DB_POOL
     if _DB_POOL is None:
-        _DB_POOL = await asyncpg.create_pool(
-            dsn=os.environ["DATABASE_URL"],
-            min_size=1,
-            max_size=5,
-            command_timeout=5,
-        )
+        # DATABASE_URL is injected by Railway (private network) and should be present.
+        conninfo = os.environ.get("DATABASE_URL")
+        if not conninfo:
+            raise RuntimeError("DATABASE_URL not set")
+        _DB_POOL = AsyncConnectionPool(conninfo=conninfo, min_size=1, max_size=5, timeout=5)
     return _DB_POOL
 
-def new_request_id() -> str:
+@app.on_event("startup")
+async def _startup_db():
+    try:
+        pool = _get_pool()
+        await pool.open()
+    except Exception:
+        # Don't crash startup just because DB isn't reachable; gate will return 503.
+        pass
+
+@app.on_event("shutdown")
+async def _shutdown_db():
+    try:
+        pool = _get_pool()
+        await pool.close()
+    except Exception:
+        pass
+
+def _new_request_id() -> str:
     return secrets.token_hex(12)
 
-async def check_subscriber(subscriber_id: str) -> tuple[bool, str]:
-    """Returns (allowed, reason_code). reason_code in: ALLOW, SUBSCRIPTION_REQUIRED, SUBSCRIPTION_DISABLED, DB_ERROR"""
+async def _check_subscriber(subscriber_id: str) -> tuple[bool, str]:
+    """Returns (allowed, reason_code)."""
     try:
-        pool = await db_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT enabled FROM subscribers WHERE subscriber_id=$1",
-                subscriber_id,
-            )
+        pool = _get_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT enabled FROM subscribers WHERE subscriber_id=%s", (subscriber_id,))
+                row = await cur.fetchone()
     except Exception:
-        return False, "DB_ERROR"
+        return (False, "DB_ERROR")
 
     if not row:
-        return False, "SUBSCRIPTION_REQUIRED"
-    if not row["enabled"]:
-        return False, "SUBSCRIPTION_DISABLED"
-    return True, "ALLOW"
+        return (False, "SUBSCRIPTION_REQUIRED")
+    enabled = bool(row[0])
+    if not enabled:
+        return (False, "SUBSCRIPTION_DISABLED")
+    return (True, "ALLOW")
 
-async def log_entitlement(*, request_id: str, subscriber_id: str | None, device_id: str | None,
-                          endpoint: str, decision: str, reason: str | None,
-                          ip: str | None, user_agent: str | None) -> None:
+async def _log_entitlement(*, request_id: str, subscriber_id: str | None, device_id: str | None,
+                          endpoint: str, decision: str, reason: str | None, ip: str | None, user_agent: str | None):
     try:
-        pool = await db_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO entitlement_events
-                (request_id, subscriber_id, device_id, endpoint, decision, reason, ip, user_agent)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                """,
-                request_id, subscriber_id, device_id, endpoint, decision, reason, ip, user_agent
-            )
+        pool = _get_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO entitlement_events
+                    (request_id, subscriber_id, device_id, endpoint, decision, reason, ip, user_agent)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (request_id, subscriber_id, device_id, endpoint, decision, reason, ip, user_agent)
+                )
     except Exception:
-        # Logging must never break /v1/analyze
-        pass
+        pass  # never block analysis
 
-async def log_usage(*, request_id: str, subscriber_id: str | None, device_id: str | None,
-                    endpoint: str, mode: str | None,
-                    num_images: int | None, image_bytes: int | None, payload_bytes: int | None,
-                    model: str | None,
-                    prompt_tokens: int | None, completion_tokens: int | None, total_tokens: int | None,
-                    api_cost_usd: float | None,
-                    latency_ms: int | None, status_code: int | None) -> None:
+async def _log_usage(*, request_id: str, subscriber_id: str | None, device_id: str | None,
+                     endpoint: str, mode: str | None,
+                     num_images: int | None, image_bytes: int | None, payload_bytes: int | None,
+                     model: str | None,
+                     prompt_tokens: int | None, completion_tokens: int | None, total_tokens: int | None,
+                     api_cost_usd: float | None,
+                     latency_ms: int | None, status_code: int | None):
     try:
-        pool = await db_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO usage_events
-                (request_id, subscriber_id, device_id, endpoint, mode,
-                 num_images, image_bytes, payload_bytes,
-                 model, prompt_tokens, completion_tokens, total_tokens,
-                 api_cost_usd, latency_ms, status_code)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-                """,
-                request_id, subscriber_id, device_id, endpoint, mode,
-                num_images, image_bytes, payload_bytes,
-                model, prompt_tokens, completion_tokens, total_tokens,
-                api_cost_usd, latency_ms, status_code
-            )
+        pool = _get_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO usage_events
+                    (request_id, subscriber_id, device_id, endpoint, mode,
+                     num_images, image_bytes, payload_bytes,
+                     model, prompt_tokens, completion_tokens, total_tokens, api_cost_usd,
+                     latency_ms, status_code)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (request_id, subscriber_id, device_id, endpoint, mode,
+                     num_images, image_bytes, payload_bytes,
+                     model, prompt_tokens, completion_tokens, total_tokens, api_cost_usd,
+                     latency_ms, status_code)
+                )
     except Exception:
         pass
-
+# --- end gate/logging ---
 
 AUDIO_DIR = Path(os.getenv("AUDIO_DIR", "./storage/audio")).expanduser().resolve()
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
@@ -133,94 +151,62 @@ async def analyze(
 ):
 
     t0 = time.perf_counter()
-    request_id = new_request_id()
+    request_id = _new_request_id()
 
-    subscriber_id = request.headers.get("X-Subscriber-Id") or None
-    device_id = request.headers.get("X-Device-Id") or None
-
-    # Optional client-provided usage headers (tray app)
-    def _as_int(v, default=0):
-        try:
-            return int(v)
-        except Exception:
-            return default
-
-    num_images_h = _as_int(request.headers.get("X-Num-Images"), 0)
-    image_bytes_h = _as_int(request.headers.get("X-Image-Bytes"), 0)
-    payload_bytes_h = _as_int(request.headers.get("X-Payload-Bytes"), 0)
+    subscriber_id = request.headers.get("X-Subscriber-Id")
+    device_id = request.headers.get("X-Device-Id")
+    num_images = int(request.headers.get("X-Num-Images") or 0)
+    image_bytes = int(request.headers.get("X-Image-Bytes") or 0)
+    payload_bytes = int(request.headers.get("X-Payload-Bytes") or 0)
 
     ip = request.client.host if request.client else None
     user_agent = request.headers.get("User-Agent")
     endpoint = str(request.url.path)
 
     if not subscriber_id:
-        await log_entitlement(
-            request_id=request_id,
-            subscriber_id=None,
-            device_id=device_id,
-            endpoint=endpoint,
-            decision="DENY",
-            reason="missing_subscriber_id",
-            ip=ip,
-            user_agent=user_agent,
+        await _log_entitlement(
+            request_id=request_id, subscriber_id=None, device_id=device_id,
+            endpoint=endpoint, decision="DENY", reason="missing_subscriber_id",
+            ip=ip, user_agent=user_agent
         )
         latency_ms = int((time.perf_counter() - t0) * 1000)
-        await log_usage(
-            request_id=request_id,
-            subscriber_id=None,
-            device_id=device_id,
-            endpoint=endpoint,
-            mode=mode,
-            num_images=num_images_h or 0,
-            image_bytes=image_bytes_h or 0,
-            payload_bytes=payload_bytes_h or 0,
-            model=None,
-            prompt_tokens=None,
-            completion_tokens=None,
-            total_tokens=None,
-            api_cost_usd=None,
-            latency_ms=latency_ms,
-            status_code=401,
+        await _log_usage(
+            request_id=request_id, subscriber_id=None, device_id=device_id,
+            endpoint=endpoint, mode=mode,
+            num_images=num_images, image_bytes=image_bytes, payload_bytes=payload_bytes,
+            model=model, prompt_tokens=None, completion_tokens=None, total_tokens=None, api_cost_usd=None,
+            latency_ms=latency_ms, status_code=401
         )
-        raise HTTPException(status_code=401, detail="Subscription required (missing subscriber id)")
+        raise HTTPException(status_code=401, detail="Subscription required: missing subscriber id")
 
-    allowed, reason_code = await check_subscriber(subscriber_id)
+    allowed, reason = await _check_subscriber(subscriber_id)
+
     if not allowed:
-        decision = "ERROR" if reason_code == "DB_ERROR" else "DENY"
-        status_code = 503 if reason_code == "DB_ERROR" else 403
-        await log_entitlement(
-            request_id=request_id,
-            subscriber_id=subscriber_id,
-            device_id=device_id,
-            endpoint=endpoint,
-            decision=decision,
-            reason=reason_code.lower(),
-            ip=ip,
-            user_agent=user_agent,
+        decision = "ERROR" if reason == "DB_ERROR" else "DENY"
+        status_code = 503 if reason == "DB_ERROR" else 403
+        await _log_entitlement(
+            request_id=request_id, subscriber_id=subscriber_id, device_id=device_id,
+            endpoint=endpoint, decision=decision, reason=reason.lower(),
+            ip=ip, user_agent=user_agent
         )
         latency_ms = int((time.perf_counter() - t0) * 1000)
-        await log_usage(
-            request_id=request_id,
-            subscriber_id=subscriber_id,
-            device_id=device_id,
-            endpoint=endpoint,
-            mode=mode,
-            num_images=num_images_h or 0,
-            image_bytes=image_bytes_h or 0,
-            payload_bytes=payload_bytes_h or 0,
-            model=None,
-            prompt_tokens=None,
-            completion_tokens=None,
-            total_tokens=None,
-            api_cost_usd=None,
-            latency_ms=latency_ms,
-            status_code=status_code,
+        await _log_usage(
+            request_id=request_id, subscriber_id=subscriber_id, device_id=device_id,
+            endpoint=endpoint, mode=mode,
+            num_images=num_images, image_bytes=image_bytes, payload_bytes=payload_bytes,
+            model=model, prompt_tokens=None, completion_tokens=None, total_tokens=None, api_cost_usd=None,
+            latency_ms=latency_ms, status_code=status_code
         )
-        if reason_code == "DB_ERROR":
-            raise HTTPException(status_code=503, detail="Network down — try again in a few minutes.")
-        raise HTTPException(status_code=403, detail="No active subscription.")
+        if reason == "DB_ERROR":
+            raise HTTPException(status_code=503, detail="Network down, try again in a few minutes")
+        raise HTTPException(status_code=403, detail="No active subscription")
 
-
+    await _log_entitlement(
+        request_id=request_id, subscriber_id=subscriber_id, device_id=device_id,
+        endpoint=endpoint, decision="ALLOW", reason=None,
+        ip=ip, user_agent=user_agent
+    )
+    raw1 = await image.read()
     if not raw1:
         raise HTTPException(status_code=400, detail="Empty image upload (image)")
 
@@ -342,8 +328,17 @@ async def analyze(
     base = str(request.base_url).rstrip("/")
     audio_full_url = f"{base}{audio_url}"
 
-    resp = {
-        "request_id": request_id,
+
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+    await _log_usage(
+        request_id=request_id, subscriber_id=subscriber_id, device_id=device_id,
+        endpoint=endpoint, mode=mode,
+        num_images=num_images, image_bytes=image_bytes, payload_bytes=payload_bytes,
+        model=model, prompt_tokens=None, completion_tokens=None, total_tokens=None, api_cost_usd=None,
+        latency_ms=latency_ms, status_code=200
+    )
+
+    return {
         "mode": mode,
         "voice": voice,
         "verdict": verdict,
@@ -367,30 +362,3 @@ async def analyze(
         "l2_timeout_s": float(os.getenv("L2_TIMEOUT_SEC", "25")),
         "frame_delay_ms": frame_delay_ms,
     }
-
-    latency_ms = int((time.perf_counter() - t0) * 1000)
-
-    # Prefer tray-provided bytes; fall back to actual sizes if headers missing
-    num_images = num_images_h or (2 if raw2 is not None else 1)
-    image_bytes = image_bytes_h or (len(raw1) + (len(raw2) if raw2 is not None else 0))
-    payload_bytes = payload_bytes_h or 0
-
-    await log_usage(
-        request_id=request_id,
-        subscriber_id=subscriber_id,
-        device_id=device_id,
-        endpoint=endpoint,
-        mode=mode,
-        num_images=num_images,
-        image_bytes=image_bytes,
-        payload_bytes=payload_bytes,
-        model=model,
-        prompt_tokens=None,
-        completion_tokens=None,
-        total_tokens=None,
-        api_cost_usd=None,
-        latency_ms=latency_ms,
-        status_code=200,
-    )
-
-    return resp
