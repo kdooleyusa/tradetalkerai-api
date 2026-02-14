@@ -9,7 +9,7 @@ from pathlib import Path
 
 from psycopg_pool import AsyncConnectionPool
 
-from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException, Header
 from fastapi.staticfiles import StaticFiles
 
 from tts import generate_tts_mp3
