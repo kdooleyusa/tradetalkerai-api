@@ -166,16 +166,24 @@ async def entitlement_check(
     Lightweight entitlement check (no image upload). Useful for debugging client headers.
     """
     request_id = _new_request_id()
+
+    # Note: x_subscriber_id may be missing/blank; _check_subscriber will return an appropriate reason.
     allowed, reason = await _check_subscriber(x_subscriber_id)
+
+    ip = request.client.host if request.client else None
+    user_agent = request.headers.get("User-Agent")
+
     await _log_entitlement(
         request_id=request_id,
         subscriber_id=x_subscriber_id,
         device_id=x_device_id,
         endpoint="/v1/entitlement",
-        decision="ALLOW" if allowed else "DENY",
+        decision="ALLOW" if allowed else ("ERROR" if reason == "DB_ERROR" else "DENY"),
         reason=reason,
-        request=request,
+        ip=ip,
+        user_agent=user_agent,
     )
+
     return {
         "ok": True,
         "request_id": request_id,
