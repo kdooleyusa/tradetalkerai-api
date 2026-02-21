@@ -16,6 +16,8 @@ from tts import generate_tts_mp3
 from vision.pipeline import analyze_chart_image_bytes
 from vision.l2_pipeline import analyze_l2_image_bytes, compute_l2_delta, build_l2_commentary
 from vision.trade_logic import build_trade_plan, build_trade_transcript
+from vision.news import fetch_finviz_news
+from vision.full_mode import build_full_transcript_llm
 
 app = FastAPI(title="TradeTalkerAI API")
 
@@ -403,8 +405,27 @@ async def analyze(
     # 3) TradePlan
     trade_plan = build_trade_plan(chart_facts, l2_1, l2_2, l2_delta)
 
-    # 4) Transcript (now mode actually changes output)
-    transcript = build_trade_transcript(chart_facts, trade_plan, l2_comment=l2_comment, mode=mode)
+    # 4) Transcript
+    mode_norm = (mode or "brief").strip().lower()
+    if mode_norm in ("full", "detail", "detailed"):
+        # Best-effort catalyst scan (headlines). Never blocks analysis if it fails.
+        news_items = []
+        try:
+            if chart_facts.symbol:
+                news_items = fetch_finviz_news(chart_facts.symbol, limit=8, timeout_s=6)
+        except Exception:
+            news_items = []
+
+        try:
+            transcript = await asyncio.wait_for(
+                build_full_transcript_llm(chart_facts, trade_plan, l2_comment=l2_comment, news=news_items),
+                timeout=float(os.getenv("FULL_TIMEOUT_SEC", "18")),
+            )
+        except Exception:
+            # Fallback to deterministic transcript
+            transcript = build_trade_transcript(chart_facts, trade_plan, l2_comment=l2_comment, mode=mode)
+    else:
+        transcript = build_trade_transcript(chart_facts, trade_plan, l2_comment=l2_comment, mode=mode)
 
     keep_looking = bool(
         (chart_facts.confidence is not None and chart_facts.confidence < 0.55)
