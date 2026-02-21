@@ -11,6 +11,10 @@ boto3==1.35.92
 pillow==10.4.0
 python-dotenv==1.2.1
 
+# Catalyst scan (headlines)
+requests==2.32.3
+beautifulsoup4==4.12.3
+
 # Postgres (psycopg3). NOTE: Do NOT install asyncpg on Python 3.13.
 psycopg[binary]==3.3.2
 psycopg-pool==3.3.0
