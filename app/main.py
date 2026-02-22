@@ -192,7 +192,7 @@ async def _log_usage(
                      api_cost_usd, latency_ms, status_code,
                      response_bytes, response_text_chars, response_text_words,
                      error_type, error_message, pricing_version)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         request_id, subscriber_id, device_id, endpoint, mode,
