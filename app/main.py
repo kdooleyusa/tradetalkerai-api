@@ -178,6 +178,14 @@ def _q6(x: Decimal) -> Decimal:
     return x.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
 
 
+def _estimate_tts_cost_from_chars(response_text_chars: int | None) -> float:
+    chars = Decimal(int(response_text_chars or 0))
+    est = chars * Decimal("0.00005")
+    if est < Decimal("0.001"):
+        est = Decimal("0.001")
+    return float(_q6(est))
+
+
 async def _estimate_costs_from_db(
     model_names: str | None,
     prompt_tokens: int | None,
@@ -681,7 +689,18 @@ async def analyze(
     analysis_cost_usd, tts_cost_usd, api_cost_usd, pricing_version_db = await _estimate_costs_from_db(
         used_model or model, prompt_tokens, completion_tokens, tts_text_input_tokens, tts_audio_output_tokens
     )
-    if pricing_version_db:
+    # Fallback TTS cost estimate when SDK does not expose TTS token usage
+    if (tts_cost_usd is None) and _has_tts_model(used_model or model):
+        tts_cost_usd = _estimate_tts_cost_from_chars(response_text_chars)
+        base_analysis = Decimal(str(analysis_cost_usd or 0))
+        api_cost_usd = float(_q6(base_analysis + Decimal(str(tts_cost_usd))))
+        if pricing_version_db:
+            pricing_version = f"{pricing_version_db}+ttschars0.00005_floor0.001"
+        elif pricing_version:
+            pricing_version = f"{pricing_version}+ttschars0.00005_floor0.001"
+        else:
+            pricing_version = "ttschars0.00005_floor0.001"
+    elif pricing_version_db:
         pricing_version = pricing_version_db
 
     latency = int((time.perf_counter() - t0) * 1000)
