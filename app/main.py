@@ -5,6 +5,7 @@ import os
 import uuid
 import time
 import secrets
+import json
 from pathlib import Path
 
 from psycopg_pool import AsyncConnectionPool
@@ -43,6 +44,7 @@ async def _db_pool() -> AsyncConnectionPool:
             raise RuntimeError("DATABASE_URL is not set")
         _DB_POOL = AsyncConnectionPool(conninfo=dsn, min_size=1, max_size=5, timeout=5, kwargs={'autocommit': True})
         await _DB_POOL.open()
+        await _ensure_usage_events_columns()
     return _DB_POOL
 
 @app.on_event("shutdown")
@@ -54,6 +56,62 @@ async def _close_db_pool():
         except Exception:
             pass
         _DB_POOL = None
+
+async def _ensure_usage_events_columns() -> None:
+    """Best-effort schema patch for newer usage tracking columns."""
+    try:
+        pool = await _db_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    ALTER TABLE usage_events
+                    ADD COLUMN IF NOT EXISTS response_bytes bigint,
+                    ADD COLUMN IF NOT EXISTS response_text_chars integer,
+                    ADD COLUMN IF NOT EXISTS response_text_words integer,
+                    ADD COLUMN IF NOT EXISTS error_type text,
+                    ADD COLUMN IF NOT EXISTS error_message text,
+                    ADD COLUMN IF NOT EXISTS pricing_version text
+                """)
+    except Exception:
+        pass
+
+def _safe_word_count(text: str | None) -> int:
+    return len((text or "").split())
+
+def _usage_int(v):
+    try:
+        return int(v) if v is not None else None
+    except Exception:
+        return None
+
+def _merge_usage_meta(items: list[dict]) -> tuple[str | None, int | None, int | None, int | None]:
+    models: list[str] = []
+    p = c = t = 0
+    any_tok = False
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        m = it.get("model")
+        if m and m not in models:
+            models.append(str(m))
+        pv = _usage_int(it.get("prompt_tokens"))
+        cv = _usage_int(it.get("completion_tokens"))
+        tv = _usage_int(it.get("total_tokens"))
+        if pv is not None:
+            p += pv; any_tok = True
+        if cv is not None:
+            c += cv; any_tok = True
+        if tv is not None:
+            t += tv; any_tok = True
+    prompt = p if any_tok else None
+    completion = c if any_tok else None
+    total = t if t else ((p + c) if any_tok else None)
+    model_joined = ",".join(models[:4]) if models else None
+    return model_joined, prompt, completion, total
+
+def _estimate_api_cost_usd(model_names: str | None, prompt_tokens: int | None, completion_tokens: int | None) -> float | None:
+    # Good-enough placeholder until pricing map is configured.
+    return None
 
 async def _check_subscriber(subscriber_id: str) -> tuple[bool, str]:
     """Returns (allowed, reason). reason: ALLOW | SUBSCRIPTION_REQUIRED | SUBSCRIPTION_DISABLED | DB_ERROR"""
@@ -114,6 +172,12 @@ async def _log_usage(
     api_cost_usd: float | None,
     latency_ms: int,
     status_code: int,
+    response_bytes: int | None = None,
+    response_text_chars: int | None = None,
+    response_text_words: int | None = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    pricing_version: str | None = None,
 ) -> None:
     try:
         pool = await _db_pool()
@@ -125,14 +189,18 @@ async def _log_usage(
                     (request_id, subscriber_id, device_id, endpoint, mode,
                      num_images, image_bytes, payload_bytes,
                      model, prompt_tokens, completion_tokens, total_tokens,
-                     api_cost_usd, latency_ms, status_code)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     api_cost_usd, latency_ms, status_code,
+                     response_bytes, response_text_chars, response_text_words,
+                     error_type, error_message, pricing_version)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         request_id, subscriber_id, device_id, endpoint, mode,
                         num_images, image_bytes, payload_bytes,
                         model, prompt_tokens, completion_tokens, total_tokens,
-                        api_cost_usd, latency_ms, status_code
+                        api_cost_usd, latency_ms, status_code,
+                        response_bytes, response_text_chars, response_text_words,
+                        error_type, error_message, pricing_version
                     ),
                 )
     except Exception:
@@ -347,6 +415,9 @@ async def analyze(
         user_agent=user_agent,
     )
 
+    usage_meta_items: list[dict] = []
+    pricing_version = os.getenv("OPENAI_PRICING_VERSION") or "local_unset"
+
     analysis_id = f"chart_{uuid.uuid4().hex[:8]}"
 
     saved = {"image": None, "image2": None}
@@ -368,10 +439,11 @@ async def analyze(
 
     # 1) Chart facts
     try:
-        chart_facts, _legacy = await asyncio.wait_for(
-            analyze_chart_image_bytes(raw1, mode=mode),
+        chart_facts, _legacy, _chart_usage = await asyncio.wait_for(
+            analyze_chart_image_bytes(raw1, mode=mode, return_meta=True),
             timeout=float(os.getenv("VISION_TIMEOUT_SEC", "25")),
         )
+        usage_meta_items.append(_chart_usage)
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Chart vision timed out. Try a clearer/closer screenshot.")
     except Exception as e:
@@ -384,15 +456,17 @@ async def analyze(
     l2_comment = None
 
     try:
-        l2_1 = await asyncio.wait_for(
-            analyze_l2_image_bytes(raw1),
+        l2_1, _l2u1 = await asyncio.wait_for(
+            analyze_l2_image_bytes(raw1, return_meta=True),
             timeout=float(os.getenv("L2_TIMEOUT_SEC", "25")),
         )
+        usage_meta_items.append(_l2u1)
         if raw2 is not None:
-            l2_2 = await asyncio.wait_for(
-                analyze_l2_image_bytes(raw2),
+            l2_2, _l2u2 = await asyncio.wait_for(
+                analyze_l2_image_bytes(raw2, return_meta=True),
                 timeout=float(os.getenv("L2_TIMEOUT_SEC", "25")),
             )
+            usage_meta_items.append(_l2u2)
             l2_delta = compute_l2_delta(l2_1, l2_2)
             l2_comment = build_l2_commentary(l2_1, l2_2, l2_delta)
         else:
@@ -417,10 +491,11 @@ async def analyze(
             news_items = []
 
         try:
-            transcript = await asyncio.wait_for(
-                build_full_transcript_llm(chart_facts, trade_plan, l2_comment=l2_comment, news=news_items),
+            transcript, _full_usage = await asyncio.wait_for(
+                build_full_transcript_llm(chart_facts, trade_plan, l2_comment=l2_comment, news=news_items, return_meta=True),
                 timeout=float(os.getenv("FULL_TIMEOUT_SEC", "18")),
             )
+            usage_meta_items.append(_full_usage)
         except Exception:
             # Fallback to deterministic transcript
             transcript = build_trade_transcript(chart_facts, trade_plan, l2_comment=l2_comment, mode=mode)
@@ -438,7 +513,7 @@ async def analyze(
 
     # 5) TTS
     try:
-        mp3_path, audio_url = await asyncio.wait_for(
+        mp3_path, audio_url, _tts_usage = await asyncio.wait_for(
             generate_tts_mp3(
                 transcript=transcript,
                 analysis_id=analysis_id,
@@ -446,9 +521,11 @@ async def analyze(
                 model=model,
                 speed=speed_f,
                 voice=voice,
+                return_meta=True,
             ),
             timeout=float(os.getenv("TTS_TIMEOUT_SEC", "25")),
         )
+        usage_meta_items.append(_tts_usage)
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="TTS timed out. Try again.")
     except Exception as e:
@@ -457,26 +534,7 @@ async def analyze(
     base = str(request.base_url).rstrip("/")
     audio_full_url = f"{base}{audio_url}"
 
-
-    latency = int((time.perf_counter() - t0) * 1000)
-    await _log_usage(
-        request_id=request_id,
-        subscriber_id=subscriber_id,
-        device_id=device_id,
-        endpoint=endpoint,
-        mode=mode,
-        num_images=num_images,
-        image_bytes=image_bytes,
-        payload_bytes=payload_bytes,
-        model=model,
-        prompt_tokens=None,
-        completion_tokens=None,
-        total_tokens=None,
-        api_cost_usd=None,
-        latency_ms=latency,
-        status_code=200,
-    )
-    return {
+    response_obj = {
         "mode": mode,
         "voice": voice,
         "verdict": verdict,
@@ -500,3 +558,33 @@ async def analyze(
         "l2_timeout_s": float(os.getenv("L2_TIMEOUT_SEC", "25")),
         "frame_delay_ms": frame_delay_ms,
     }
+
+    response_bytes = len(json.dumps(response_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    response_text_chars = len(transcript or "")
+    response_text_words = _safe_word_count(transcript)
+    used_model, prompt_tokens, completion_tokens, total_tokens = _merge_usage_meta(usage_meta_items)
+    api_cost_usd = _estimate_api_cost_usd(used_model, prompt_tokens, completion_tokens)
+
+    latency = int((time.perf_counter() - t0) * 1000)
+    await _log_usage(
+        request_id=request_id,
+        subscriber_id=subscriber_id,
+        device_id=device_id,
+        endpoint=endpoint,
+        mode=mode,
+        num_images=num_images,
+        image_bytes=image_bytes,
+        payload_bytes=payload_bytes,
+        model=used_model or model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        api_cost_usd=api_cost_usd,
+        latency_ms=latency,
+        status_code=200,
+        response_bytes=response_bytes,
+        response_text_chars=response_text_chars,
+        response_text_words=response_text_words,
+        pricing_version=pricing_version,
+    )
+    return response_obj
