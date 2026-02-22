@@ -4,7 +4,7 @@ import base64
 import json
 import os
 import re
-from typing import Optional
+from typing import Optional, Any
 
 from openai import AsyncOpenAI
 
@@ -13,6 +13,16 @@ from .schema import L2Snapshot, L2Delta, L2Row
 from .prompt_l2 import SYSTEM_L2, USER_L2
 
 L2_MODEL = os.getenv("L2_MODEL", os.getenv("VISION_MODEL", "gpt-4o-mini"))
+
+def _usage_meta(resp, *, model_fallback: str | None = None) -> dict[str, Any]:
+    usage = getattr(resp, "usage", None)
+    return {
+        "model": getattr(resp, "model", None) or model_fallback,
+        "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage is not None else None,
+        "completion_tokens": getattr(usage, "completion_tokens", None) if usage is not None else None,
+        "total_tokens": getattr(usage, "total_tokens", None) if usage is not None else None,
+    }
+
 
 _SIZE_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([KMB])?\s*$", re.IGNORECASE)
 
@@ -71,7 +81,7 @@ def _has_meaningful_l2(snap: L2Snapshot) -> bool:
         return True
     return False
 
-async def analyze_l2_image_bytes(raw_image_bytes: bytes) -> L2Snapshot:
+async def analyze_l2_image_bytes(raw_image_bytes: bytes, return_meta: bool = False) -> L2Snapshot | tuple[L2Snapshot, dict[str, Any]]:
     """Extract a snapshot of the ladder/L2 visible in the screenshot."""
     client = AsyncOpenAI()
     png = preprocess_to_png_bytes(raw_image_bytes)
@@ -116,6 +126,8 @@ async def analyze_l2_image_bytes(raw_image_bytes: bytes) -> L2Snapshot:
     snap.ask_sum = _sum_sizes(asks[:5])
     denom = snap.bid_sum + snap.ask_sum
     snap.imbalance = (snap.bid_sum / denom) if denom > 0 else None
+    if return_meta:
+        return snap, _usage_meta(resp, model_fallback=L2_MODEL)
     return snap
 
 def compute_l2_delta(a: L2Snapshot, b: L2Snapshot) -> L2Delta:

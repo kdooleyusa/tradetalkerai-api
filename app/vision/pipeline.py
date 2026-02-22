@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
-from typing import Tuple
+from typing import Tuple, Any
 
 from openai import AsyncOpenAI
 
@@ -12,6 +12,17 @@ from .preprocess import preprocess_to_png_bytes
 from .prompt import SYSTEM, USER
 
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
+
+
+def _usage_meta(resp, *, model_fallback: str | None = None) -> dict[str, Any]:
+    usage = getattr(resp, "usage", None)
+    return {
+        "model": getattr(resp, "model", None) or model_fallback,
+        "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage is not None else None,
+        "completion_tokens": getattr(usage, "completion_tokens", None) if usage is not None else None,
+        "total_tokens": getattr(usage, "total_tokens", None) if usage is not None else None,
+    }
+
 
 
 def _to_data_url_png(png_bytes: bytes) -> str:
@@ -141,7 +152,7 @@ def build_transcript_from_facts(f: ChartFacts, mode: str = "brief") -> str:
     return " ".join(parts)
 
 
-async def analyze_chart_image_bytes(raw_image_bytes: bytes, mode: str = "brief") -> Tuple[ChartFacts, str]:
+async def analyze_chart_image_bytes(raw_image_bytes: bytes, mode: str = "brief", return_meta: bool = False) -> Tuple[ChartFacts, str] | Tuple[ChartFacts, str, dict[str, Any]]:
     """Vision → ChartFacts (+ transcript).
 
     Enforces Option A post-parse: support/resistance should be horizontal levels,
@@ -198,7 +209,11 @@ async def analyze_chart_image_bytes(raw_image_bytes: bytes, mode: str = "brief")
         facts = ChartFacts.model_validate(data)
     except Exception as e:
         facts = ChartFacts(confidence=0.0, notes=[f"Vision JSON parse failed: {type(e).__name__}"])
+        if return_meta:
+            return facts, "I had trouble reading the chart output. Keep looking.", {"model": VISION_MODEL, "prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
         return facts, "I had trouble reading the chart output. Keep looking."
 
     transcript = build_transcript_from_facts(facts, mode=mode)
+    if return_meta:
+        return facts, transcript, _usage_meta(resp, model_fallback=VISION_MODEL)
     return facts, transcript

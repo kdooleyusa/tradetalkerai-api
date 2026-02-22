@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List, Optional
+from typing import List, Optional, Any
 
 from openai import AsyncOpenAI
 
@@ -12,8 +12,18 @@ from .news import NewsItem
 
 TEXT_MODEL = os.getenv("TEXT_MODEL", os.getenv("VISION_MODEL", "gpt-4o-mini"))
 
+def _usage_meta(resp, *, model_fallback: str | None = None) -> dict[str, Any]:
+    usage = getattr(resp, "usage", None)
+    return {
+        "model": getattr(resp, "model", None) or model_fallback,
+        "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage is not None else None,
+        "completion_tokens": getattr(usage, "completion_tokens", None) if usage is not None else None,
+        "total_tokens": getattr(usage, "total_tokens", None) if usage is not None else None,
+    }
 
-def _clip(s: str, n: int) -> str:
+
+
+def _clip(s: str, n: int) -> str | tuple[str, dict[str, Any]]:
     s = (s or "").strip()
     return s if len(s) <= n else (s[: n - 1].rstrip() + "…")
 
@@ -24,7 +34,8 @@ async def build_full_transcript_llm(
     *,
     l2_comment: Optional[str] = None,
     news: Optional[List[NewsItem]] = None,
-) -> str:
+    return_meta: bool = False,
+) -> str | tuple[str, dict[str, Any]]:
     """Create the F8/FULL spoken transcript (chart + plan + catalyst scan)."""
 
     symbol = (facts.symbol or "").strip().upper() or "UNKNOWN"
@@ -78,5 +89,7 @@ async def build_full_transcript_llm(
         ],
         temperature=0.2,
     )
-    text = (resp.choices[0].message.content or "").strip()
-    return _clip(text, 1800)
+    text = _clip((resp.choices[0].message.content or "").strip(), 1800)
+    if return_meta:
+        return text, _usage_meta(resp, model_fallback=TEXT_MODEL)
+    return text
