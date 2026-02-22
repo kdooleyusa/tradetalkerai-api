@@ -6,6 +6,7 @@ import uuid
 import time
 import secrets
 import json
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 from psycopg_pool import AsyncConnectionPool
@@ -70,7 +71,11 @@ async def _ensure_usage_events_columns() -> None:
                     ADD COLUMN IF NOT EXISTS response_text_words integer,
                     ADD COLUMN IF NOT EXISTS error_type text,
                     ADD COLUMN IF NOT EXISTS error_message text,
-                    ADD COLUMN IF NOT EXISTS pricing_version text
+                    ADD COLUMN IF NOT EXISTS pricing_version text,
+                    ADD COLUMN IF NOT EXISTS tts_text_input_tokens integer,
+                    ADD COLUMN IF NOT EXISTS tts_audio_output_tokens integer,
+                    ADD COLUMN IF NOT EXISTS analysis_cost_usd numeric(10,6),
+                    ADD COLUMN IF NOT EXISTS tts_cost_usd numeric(10,6)
                 """)
     except Exception:
         pass
@@ -84,34 +89,138 @@ def _usage_int(v):
     except Exception:
         return None
 
-def _merge_usage_meta(items: list[dict]) -> tuple[str | None, int | None, int | None, int | None]:
+def _merge_usage_meta(items: list[dict]) -> tuple[str | None, int | None, int | None, int | None, int | None, int | None]:
+    """Aggregate usage while keeping TTS usage separate from main analysis token totals."""
     models: list[str] = []
     p = c = t = 0
-    any_tok = False
+    tts_text = tts_audio = 0
+    any_main_tok = False
+    any_tts_tok = False
     for it in items or []:
         if not isinstance(it, dict):
             continue
-        m = it.get("model")
+        m = str(it.get("model") or "")
         if m and m not in models:
-            models.append(str(m))
+            models.append(m)
+        is_tts = "tts" in m.lower()
+        if is_tts:
+            tv = _usage_int(it.get("tts_text_input_tokens"))
+            av = _usage_int(it.get("tts_audio_output_tokens"))
+            if tv is not None:
+                tts_text += tv
+                any_tts_tok = True
+            if av is not None:
+                tts_audio += av
+                any_tts_tok = True
+            continue
+
         pv = _usage_int(it.get("prompt_tokens"))
         cv = _usage_int(it.get("completion_tokens"))
-        tv = _usage_int(it.get("total_tokens"))
+        tv2 = _usage_int(it.get("total_tokens"))
         if pv is not None:
-            p += pv; any_tok = True
+            p += pv
+            any_main_tok = True
         if cv is not None:
-            c += cv; any_tok = True
-        if tv is not None:
-            t += tv; any_tok = True
-    prompt = p if any_tok else None
-    completion = c if any_tok else None
-    total = t if t else ((p + c) if any_tok else None)
-    model_joined = ",".join(models[:4]) if models else None
-    return model_joined, prompt, completion, total
+            c += cv
+            any_main_tok = True
+        if tv2 is not None:
+            t += tv2
+            any_main_tok = True
 
-def _estimate_api_cost_usd(model_names: str | None, prompt_tokens: int | None, completion_tokens: int | None) -> float | None:
-    # Good-enough placeholder until pricing map is configured.
-    return None
+    prompt = p if any_main_tok else None
+    completion = c if any_main_tok else None
+    total = t if t else ((p + c) if any_main_tok else None)
+    model_joined = ",".join(models[:6]) if models else None
+    return model_joined, prompt, completion, total, (tts_text if any_tts_tok else None), (tts_audio if any_tts_tok else None)
+
+
+def _pick_primary_model(model_names: str | None) -> str | None:
+    parts = [p.strip() for p in str(model_names or "").split(",") if p.strip()]
+    for p in parts:
+        if "tts" not in p.lower():
+            return p
+    return parts[0] if parts else None
+
+
+def _has_tts_model(model_names: str | None) -> bool:
+    return any("tts" in p.strip().lower() for p in str(model_names or "").split(",") if p.strip())
+
+
+async def _resolve_model_rate_row(model_name: str | None) -> dict | None:
+    if not model_name:
+        return None
+    try:
+        pool = await _db_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT model, kind, alias_to, input_per_1m, cached_input_per_1m, output_per_1m,
+                           text_input_per_1m, audio_output_per_1m, pricing_version
+                    FROM model_rate_table
+                    WHERE model = %s
+                    """,
+                    (model_name,),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                keys = [
+                    "model", "kind", "alias_to", "input_per_1m", "cached_input_per_1m", "output_per_1m",
+                    "text_input_per_1m", "audio_output_per_1m", "pricing_version"
+                ]
+                return dict(zip(keys, row))
+    except Exception:
+        return None
+
+
+def _q6(x: Decimal) -> Decimal:
+    return x.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+
+
+async def _estimate_costs_from_db(
+    model_names: str | None,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    tts_text_input_tokens: int | None = None,
+    tts_audio_output_tokens: int | None = None,
+) -> tuple[float | None, float | None, float | None, str | None]:
+    analysis_cost = None
+    tts_cost = None
+    pricing_version = None
+
+    primary = _pick_primary_model(model_names)
+    rr = await _resolve_model_rate_row(primary)
+    if rr and rr.get("kind") == "alias" and rr.get("alias_to"):
+        rr = await _resolve_model_rate_row(rr.get("alias_to")) or rr
+    if rr and rr.get("input_per_1m") is not None and rr.get("output_per_1m") is not None:
+        in_rate = Decimal(str(rr["input_per_1m"]))
+        out_rate = Decimal(str(rr["output_per_1m"]))
+        p_tok = Decimal(int(prompt_tokens or 0))
+        c_tok = Decimal(int(completion_tokens or 0))
+        analysis_cost = _q6((p_tok / Decimal("1000000")) * in_rate + (c_tok / Decimal("1000000")) * out_rate)
+        pricing_version = rr.get("pricing_version") or pricing_version
+
+    if _has_tts_model(model_names) and (tts_text_input_tokens is not None or tts_audio_output_tokens is not None):
+        tr = await _resolve_model_rate_row("gpt-4o-mini-tts")
+        if tr and tr.get("text_input_per_1m") is not None and tr.get("audio_output_per_1m") is not None:
+            ti_rate = Decimal(str(tr["text_input_per_1m"]))
+            ao_rate = Decimal(str(tr["audio_output_per_1m"]))
+            ti_tok = Decimal(int(tts_text_input_tokens or 0))
+            ao_tok = Decimal(int(tts_audio_output_tokens or 0))
+            tts_cost = _q6((ti_tok / Decimal("1000000")) * ti_rate + (ao_tok / Decimal("1000000")) * ao_rate)
+            pricing_version = pricing_version or tr.get("pricing_version")
+
+    total_cost = None
+    if analysis_cost is not None or tts_cost is not None:
+        total_cost = _q6((analysis_cost or Decimal("0")) + (tts_cost or Decimal("0")))
+
+    return (
+        float(analysis_cost) if analysis_cost is not None else None,
+        float(tts_cost) if tts_cost is not None else None,
+        float(total_cost) if total_cost is not None else None,
+        pricing_version,
+    )
 
 async def _check_subscriber(subscriber_id: str) -> tuple[bool, str]:
     """Returns (allowed, reason). reason: ALLOW | SUBSCRIPTION_REQUIRED | SUBSCRIPTION_DISABLED | DB_ERROR"""
@@ -178,6 +287,10 @@ async def _log_usage(
     error_type: str | None = None,
     error_message: str | None = None,
     pricing_version: str | None = None,
+    tts_text_input_tokens: int | None = None,
+    tts_audio_output_tokens: int | None = None,
+    analysis_cost_usd: float | None = None,
+    tts_cost_usd: float | None = None,
 ) -> None:
     try:
         pool = await _db_pool()
@@ -191,8 +304,9 @@ async def _log_usage(
                      model, prompt_tokens, completion_tokens, total_tokens,
                      api_cost_usd, latency_ms, status_code,
                      response_bytes, response_text_chars, response_text_words,
-                     error_type, error_message, pricing_version)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     error_type, error_message, pricing_version,
+                     tts_text_input_tokens, tts_audio_output_tokens, analysis_cost_usd, tts_cost_usd)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         request_id, subscriber_id, device_id, endpoint, mode,
@@ -200,7 +314,8 @@ async def _log_usage(
                         model, prompt_tokens, completion_tokens, total_tokens,
                         api_cost_usd, latency_ms, status_code,
                         response_bytes, response_text_chars, response_text_words,
-                        error_type, error_message, pricing_version
+                        error_type, error_message, pricing_version,
+                        tts_text_input_tokens, tts_audio_output_tokens, analysis_cost_usd, tts_cost_usd
                     ),
                 )
     except Exception:
@@ -562,8 +677,12 @@ async def analyze(
     response_bytes = len(json.dumps(response_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     response_text_chars = len(transcript or "")
     response_text_words = _safe_word_count(transcript)
-    used_model, prompt_tokens, completion_tokens, total_tokens = _merge_usage_meta(usage_meta_items)
-    api_cost_usd = _estimate_api_cost_usd(used_model, prompt_tokens, completion_tokens)
+    used_model, prompt_tokens, completion_tokens, total_tokens, tts_text_input_tokens, tts_audio_output_tokens = _merge_usage_meta(usage_meta_items)
+    analysis_cost_usd, tts_cost_usd, api_cost_usd, pricing_version_db = await _estimate_costs_from_db(
+        used_model or model, prompt_tokens, completion_tokens, tts_text_input_tokens, tts_audio_output_tokens
+    )
+    if pricing_version_db:
+        pricing_version = pricing_version_db
 
     latency = int((time.perf_counter() - t0) * 1000)
     await _log_usage(
@@ -586,5 +705,9 @@ async def analyze(
         response_text_chars=response_text_chars,
         response_text_words=response_text_words,
         pricing_version=pricing_version,
+        tts_text_input_tokens=tts_text_input_tokens,
+        tts_audio_output_tokens=tts_audio_output_tokens,
+        analysis_cost_usd=analysis_cost_usd,
+        tts_cost_usd=tts_cost_usd,
     )
     return response_obj
