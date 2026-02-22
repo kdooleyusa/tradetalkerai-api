@@ -40,19 +40,67 @@ def _response_to_bytes(resp) -> bytes:
         raise RuntimeError("Could not extract audio bytes from TTS response.")
 
 
+def _uget(obj: Any, *names: str):
+    for n in names:
+        try:
+            if obj is not None and hasattr(obj, n):
+                v = getattr(obj, n)
+                if v is not None:
+                    return v
+        except Exception:
+            pass
+    return None
+
+
+def _usage_nested_token(usage: Any, detail_attr: str, key_names: tuple[str, ...]) -> Any:
+    details = _uget(usage, detail_attr)
+    if details is None:
+        return None
+    for k in key_names:
+        try:
+            if hasattr(details, k):
+                v = getattr(details, k)
+                if v is not None:
+                    return v
+        except Exception:
+            pass
+        try:
+            if isinstance(details, dict) and k in details and details[k] is not None:
+                return details[k]
+        except Exception:
+            pass
+    return None
 
 
 def _extract_usage_meta_from_resp(resp, *, model_fallback: str | None = None) -> dict[str, Any]:
     usage = getattr(resp, "usage", None)
-    prompt_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
-    completion_tokens = getattr(usage, "completion_tokens", None) if usage is not None else None
-    total_tokens = getattr(usage, "total_tokens", None) if usage is not None else None
+    prompt_tokens = _uget(usage, "prompt_tokens")
+    completion_tokens = _uget(usage, "completion_tokens")
+    total_tokens = _uget(usage, "total_tokens")
     model_name = getattr(resp, "model", None) or model_fallback
+
+    tts_text_input_tokens = (
+        _uget(usage, "text_input_tokens", "input_text_tokens")
+        or _usage_nested_token(usage, "input_token_details", ("text_tokens", "input_text_tokens"))
+    )
+    tts_audio_output_tokens = (
+        _uget(usage, "audio_output_tokens", "output_audio_tokens")
+        or _usage_nested_token(usage, "output_token_details", ("audio_tokens", "output_audio_tokens"))
+    )
+
+    if model_name and "tts" in str(model_name).lower():
+        if tts_text_input_tokens is None:
+            tts_text_input_tokens = _uget(usage, "input_tokens", "prompt_tokens")
+        if tts_audio_output_tokens is None:
+            tts_audio_output_tokens = _uget(usage, "output_tokens", "completion_tokens")
+
     return {
         "model": model_name,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
+        "tts_text_input_tokens": tts_text_input_tokens,
+        "tts_audio_output_tokens": tts_audio_output_tokens,
     }
 
 def _resolve_voice(voice_id: int | None) -> str:
