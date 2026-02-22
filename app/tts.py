@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Any
 
 from openai import AsyncOpenAI
 
@@ -40,6 +40,21 @@ def _response_to_bytes(resp) -> bytes:
         raise RuntimeError("Could not extract audio bytes from TTS response.")
 
 
+
+
+def _extract_usage_meta_from_resp(resp, *, model_fallback: str | None = None) -> dict[str, Any]:
+    usage = getattr(resp, "usage", None)
+    prompt_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
+    completion_tokens = getattr(usage, "completion_tokens", None) if usage is not None else None
+    total_tokens = getattr(usage, "total_tokens", None) if usage is not None else None
+    model_name = getattr(resp, "model", None) or model_fallback
+    return {
+        "model": model_name,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
 def _resolve_voice(voice_id: int | None) -> str:
     env_voice = os.getenv("TTS_VOICE")
     if env_voice:
@@ -61,7 +76,8 @@ async def generate_tts_mp3(
     model: str | None = None,
     speed: float | None = None,
     voice: int | None = None,
-) -> Tuple[Path, str]:
+    return_meta: bool = False,
+) -> Tuple[Path, str] | Tuple[Path, str, dict[str, Any]]:
     """Generate MP3 TTS audio and save it locally.
 
     voice: integer 1..6
@@ -105,5 +121,8 @@ async def generate_tts_mp3(
 
     if mp3_path.stat().st_size == 0:
         raise RuntimeError("TTS generated a 0-byte file (unexpected).")
+
+    if return_meta:
+        return mp3_path, f"/audio/{mp3_path.name}", _extract_usage_meta_from_resp(resp, model_fallback=model)
 
     return mp3_path, f"/audio/{mp3_path.name}"
