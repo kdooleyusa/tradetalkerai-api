@@ -179,13 +179,6 @@ def _q6(x: Decimal) -> Decimal:
     return x.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
 
 
-def _round_usd_to_cent_and_credits(api_cost_usd: float | None) -> tuple[float | None, int | None]:
-    if api_cost_usd is None:
-        return None, None
-    cents = int(Decimal(str(api_cost_usd)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) * 100)
-    return (float(Decimal(cents) / Decimal(100)), cents)
-
-
 def _estimate_tts_cost_from_chars(response_text_chars: int | None) -> float:
     chars = Decimal(int(response_text_chars or 0))
     est = chars * Decimal("0.00005")
@@ -237,6 +230,70 @@ async def _estimate_costs_from_db(
         float(total_cost) if total_cost is not None else None,
         pricing_version,
     )
+
+def _round_to_penny_and_credits(api_cost_usd: float | None) -> tuple[float | None, int | None]:
+    if api_cost_usd is None:
+        return None, None
+    amt = Decimal(str(api_cost_usd)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    credits = int((amt * Decimal("100")).to_integral_value(rounding=ROUND_HALF_UP))
+    return float(amt), credits
+
+
+async def _debit_credits_usage(
+    subscriber_id: str | None,
+    credits_used: int | None,
+    usage_event_id: int | None,
+    request_id: str | None,
+    note: str | None = None,
+) -> int | None:
+    """Best-effort ledger debit. Returns remaining balance if credit_ledger exists."""
+    if not subscriber_id or credits_used is None:
+        return None
+    if credits_used <= 0:
+        return await _get_credit_balance(subscriber_id)
+    try:
+        pool = await _db_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    WITH bal AS (
+                      SELECT COALESCE(SUM(credits_delta), 0)::integer AS b
+                      FROM credit_ledger
+                      WHERE subscriber_id = %s
+                    ),
+                    ins AS (
+                      INSERT INTO credit_ledger
+                      (subscriber_id, event_type, credits_delta, balance_after, usage_event_id, request_id, note, created_by)
+                      SELECT %s, 'usage', %s, ((SELECT b FROM bal) + %s), %s, %s, %s, 'system'
+                      RETURNING balance_after
+                    )
+                    SELECT balance_after FROM ins
+                    """,
+                    (subscriber_id, subscriber_id, -credits_used, -credits_used, usage_event_id, request_id, note or 'Analyze request credits'),
+                )
+                row = await cur.fetchone()
+                return int(row[0]) if row and row[0] is not None else None
+    except Exception:
+        return None
+
+
+async def _get_credit_balance(subscriber_id: str | None) -> int | None:
+    if not subscriber_id:
+        return None
+    try:
+        pool = await _db_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT COALESCE(SUM(credits_delta), 0)::integer FROM credit_ledger WHERE subscriber_id = %s",
+                    (subscriber_id,),
+                )
+                row = await cur.fetchone()
+                return int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        return None
+
 
 async def _check_subscriber(subscriber_id: str) -> tuple[bool, str]:
     """Returns (allowed, reason). reason: ALLOW | SUBSCRIPTION_REQUIRED | SUBSCRIPTION_DISABLED | DB_ERROR"""
@@ -308,7 +365,7 @@ async def _log_usage(
     analysis_cost_usd: float | None = None,
     tts_cost_usd: float | None = None,
     credits_used: int | None = None,
-) -> None:
+) -> int | None:
     try:
         pool = await _db_pool()
         async with pool.connection() as conn:
@@ -324,6 +381,7 @@ async def _log_usage(
                      error_type, error_message, pricing_version,
                      tts_text_input_tokens, tts_audio_output_tokens, analysis_cost_usd, tts_cost_usd, credits_used)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING id
                     """,
                     (
                         request_id, subscriber_id, device_id, endpoint, mode,
@@ -335,8 +393,10 @@ async def _log_usage(
                         tts_text_input_tokens, tts_audio_output_tokens, analysis_cost_usd, tts_cost_usd, credits_used
                     ),
                 )
+                row = await cur.fetchone()
+                return int(row[0]) if row and row[0] is not None else None
     except Exception:
-        pass
+        return None
 
 
 
@@ -712,11 +772,13 @@ async def analyze(
     elif pricing_version_db:
         pricing_version = pricing_version_db
 
-    # Bill in credits where 1 credit = $0.01 (nearest penny)
-    api_cost_usd_rounded, credits_used = _round_usd_to_cent_and_credits(api_cost_usd)
+    api_cost_usd, credits_used = _round_to_penny_and_credits(api_cost_usd)
+
+    credits_remaining = None
+    credit_line = None
 
     latency = int((time.perf_counter() - t0) * 1000)
-    await _log_usage(
+    usage_event_id = await _log_usage(
         request_id=request_id,
         subscriber_id=subscriber_id,
         device_id=device_id,
@@ -729,7 +791,7 @@ async def analyze(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
-        api_cost_usd=api_cost_usd_rounded,
+        api_cost_usd=api_cost_usd,
         latency_ms=latency,
         status_code=200,
         response_bytes=response_bytes,
@@ -742,4 +804,23 @@ async def analyze(
         tts_cost_usd=tts_cost_usd,
         credits_used=credits_used,
     )
+
+    credits_remaining = await _debit_credits_usage(
+        subscriber_id=subscriber_id,
+        credits_used=credits_used,
+        usage_event_id=usage_event_id,
+        request_id=request_id,
+        note=f"Analyze request ({mode})",
+    )
+
+    if credits_used is not None:
+        if credits_remaining is not None:
+            credit_line = f"Analysis used {credits_used} credits. You have {credits_remaining} credits left."
+        else:
+            credit_line = f"Analysis used {credits_used} credits."
+        transcript_with_credit = (transcript or "").rstrip() + "\n\n" + credit_line
+        response_obj["transcript"] = transcript_with_credit
+        response_obj["credits_used"] = credits_used
+        response_obj["credits_remaining"] = credits_remaining
+        response_obj["api_cost_usd"] = api_cost_usd
     return response_obj
