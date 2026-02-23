@@ -469,6 +469,7 @@ async def analyze(
     voice: int = Form(1),
     save_chart: bool = Form(False),
     frame_delay_ms: int | None = Form(None),
+    include_audio: bool = Form(True),
 
 ):
     t0 = time.perf_counter()
@@ -703,32 +704,37 @@ async def analyze(
     )
     verdict = "keep_looking" if keep_looking else "actionable"
 
-    # 5) TTS
-    try:
-        mp3_path, audio_url, _tts_usage = await asyncio.wait_for(
-            generate_tts_mp3(
-                transcript=transcript,
-                analysis_id=analysis_id,
-                out_dir=Path(os.getenv("AUDIO_DIR", "./storage/audio")).expanduser().resolve(),
-                model=model,
-                speed=speed_f,
-                voice=voice,
-                return_meta=True,
-            ),
-            timeout=float(os.getenv("TTS_TIMEOUT_SEC", "25")),
-        )
-        usage_meta_items.append(_tts_usage)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="TTS timed out. Try again.")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"TTS failed: {type(e).__name__}: {e}")
+    # 5) TTS (optional; skipped when client requests text-only to save cost)
+    mp3_path = None
+    audio_url = None
+    audio_full_url = None
+    if include_audio:
+        try:
+            mp3_path, audio_url, _tts_usage = await asyncio.wait_for(
+                generate_tts_mp3(
+                    transcript=transcript,
+                    analysis_id=analysis_id,
+                    out_dir=Path(os.getenv("AUDIO_DIR", "./storage/audio")).expanduser().resolve(),
+                    model=model,
+                    speed=speed_f,
+                    voice=voice,
+                    return_meta=True,
+                ),
+                timeout=float(os.getenv("TTS_TIMEOUT_SEC", "25")),
+            )
+            usage_meta_items.append(_tts_usage)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="TTS timed out. Try again.")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"TTS failed: {type(e).__name__}: {e}")
 
-    base = str(request.base_url).rstrip("/")
-    audio_full_url = f"{base}{audio_url}"
+        base = str(request.base_url).rstrip("/")
+        audio_full_url = f"{base}{audio_url}"
 
     response_obj = {
         "mode": mode,
         "voice": voice,
+        "include_audio": include_audio,
         "verdict": verdict,
         "keep_looking": keep_looking,
         "confidence": chart_facts.confidence,
@@ -741,9 +747,9 @@ async def analyze(
         "transcript": transcript,
         "audio_url": audio_url,
         "audio_full_url": audio_full_url,
-        "mp3_bytes": mp3_path.stat().st_size if mp3_path.exists() else 0,
-        "audio_dir": str(AUDIO_DIR),
-        "filename": mp3_path.name,
+        "mp3_bytes": (mp3_path.stat().st_size if (mp3_path and mp3_path.exists()) else 0),
+        "audio_dir": (str(AUDIO_DIR) if include_audio else None),
+        "filename": (mp3_path.name if mp3_path else None),
         "saved_upload": saved,
         "chart_dir": str(CHART_DIR),
         "vision_timeout_s": float(os.getenv("VISION_TIMEOUT_SEC", "25")),
