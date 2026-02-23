@@ -75,7 +75,8 @@ async def _ensure_usage_events_columns() -> None:
                     ADD COLUMN IF NOT EXISTS tts_text_input_tokens integer,
                     ADD COLUMN IF NOT EXISTS tts_audio_output_tokens integer,
                     ADD COLUMN IF NOT EXISTS analysis_cost_usd numeric(10,6),
-                    ADD COLUMN IF NOT EXISTS tts_cost_usd numeric(10,6)
+                    ADD COLUMN IF NOT EXISTS tts_cost_usd numeric(10,6),
+                    ADD COLUMN IF NOT EXISTS credits_used integer
                 """)
     except Exception:
         pass
@@ -176,6 +177,13 @@ async def _resolve_model_rate_row(model_name: str | None) -> dict | None:
 
 def _q6(x: Decimal) -> Decimal:
     return x.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+
+
+def _round_usd_to_cent_and_credits(api_cost_usd: float | None) -> tuple[float | None, int | None]:
+    if api_cost_usd is None:
+        return None, None
+    cents = int(Decimal(str(api_cost_usd)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) * 100)
+    return (float(Decimal(cents) / Decimal(100)), cents)
 
 
 def _estimate_tts_cost_from_chars(response_text_chars: int | None) -> float:
@@ -299,6 +307,7 @@ async def _log_usage(
     tts_audio_output_tokens: int | None = None,
     analysis_cost_usd: float | None = None,
     tts_cost_usd: float | None = None,
+    credits_used: int | None = None,
 ) -> None:
     try:
         pool = await _db_pool()
@@ -313,8 +322,8 @@ async def _log_usage(
                      api_cost_usd, latency_ms, status_code,
                      response_bytes, response_text_chars, response_text_words,
                      error_type, error_message, pricing_version,
-                     tts_text_input_tokens, tts_audio_output_tokens, analysis_cost_usd, tts_cost_usd)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     tts_text_input_tokens, tts_audio_output_tokens, analysis_cost_usd, tts_cost_usd, credits_used)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         request_id, subscriber_id, device_id, endpoint, mode,
@@ -323,7 +332,7 @@ async def _log_usage(
                         api_cost_usd, latency_ms, status_code,
                         response_bytes, response_text_chars, response_text_words,
                         error_type, error_message, pricing_version,
-                        tts_text_input_tokens, tts_audio_output_tokens, analysis_cost_usd, tts_cost_usd
+                        tts_text_input_tokens, tts_audio_output_tokens, analysis_cost_usd, tts_cost_usd, credits_used
                     ),
                 )
     except Exception:
@@ -703,6 +712,9 @@ async def analyze(
     elif pricing_version_db:
         pricing_version = pricing_version_db
 
+    # Bill in credits where 1 credit = $0.01 (nearest penny)
+    api_cost_usd_rounded, credits_used = _round_usd_to_cent_and_credits(api_cost_usd)
+
     latency = int((time.perf_counter() - t0) * 1000)
     await _log_usage(
         request_id=request_id,
@@ -717,7 +729,7 @@ async def analyze(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
-        api_cost_usd=api_cost_usd,
+        api_cost_usd=api_cost_usd_rounded,
         latency_ms=latency,
         status_code=200,
         response_bytes=response_bytes,
@@ -728,5 +740,6 @@ async def analyze(
         tts_audio_output_tokens=tts_audio_output_tokens,
         analysis_cost_usd=analysis_cost_usd,
         tts_cost_usd=tts_cost_usd,
+        credits_used=credits_used,
     )
     return response_obj
