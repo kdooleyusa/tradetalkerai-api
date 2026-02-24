@@ -163,8 +163,20 @@ async def analyze(
     else:
         trade_plan = build_trade_plan(chart_facts, l2_1, l2_2, l2_delta)
 
-    # 4) Transcript (now mode actually changes output)
-    transcript = build_trade_transcript(chart_facts, trade_plan, l2_comment=(l2_comment if l2_is_meaningful(l2_comment) else None), mode=mode)
+    # 4) Transcript (mode-aware, with always-on L2 commentary for BRIEF/MOMENTUM when ladder is visible)
+    mode_norm = (mode or "brief").strip().lower()
+    include_l2_in_transcript = False
+    if mode_norm in ("brief", "quick", "scan", "momentum", "momo", "mom"):
+        include_l2_in_transcript = bool(l2_1 and l2_1.ladder_visible)
+    else:
+        include_l2_in_transcript = l2_is_meaningful(l2_comment)
+
+    transcript = build_trade_transcript(
+        chart_facts,
+        trade_plan,
+        l2_comment=(l2_comment if include_l2_in_transcript else None),
+        mode=mode,
+    )
 
     keep_looking = should_keep_looking_from_plan(
         trade_plan,
