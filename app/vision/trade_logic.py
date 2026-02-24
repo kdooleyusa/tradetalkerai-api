@@ -602,6 +602,77 @@ def _voice_l2_commentary(l2_comment: str | None) -> str | None:
     return raw + '.'
 
 
+def _price_status_vs_entry(current_price: Optional[float], entry_price: Optional[float]) -> str | None:
+    if current_price is None or entry_price is None:
+        return None
+    diff = float(current_price) - float(entry_price)
+    tol = max(0.01, abs(float(entry_price)) * 0.0005)
+    if diff > tol:
+        return "Profitable now"
+    if diff < -tol:
+        return "Under water now"
+    return "Near breakeven now"
+
+
+def _position_recheck_line(facts: ChartFacts, plan: TradePlan, mode: str = "brief") -> str | None:
+    """Build a short position re-evaluation line for BRIEF/MOMENTUM when a visible position overlay is present."""
+    if _mode_norm(mode) not in ("brief", "momentum"):
+        return None
+    if not getattr(facts, "position_visible", False):
+        return None
+
+    bits: list[str] = ["Re-evaluating current position."]
+
+    status = _price_status_vs_entry(facts.last_price, getattr(facts, "position_entry_price", None))
+    if status:
+        bits.append(status + ".")
+
+    cur_entry = getattr(facts, "position_entry_price", None)
+    cur_stop = getattr(facts, "position_stop_price", None)
+    cur_tp = getattr(facts, "position_target_price", None)
+
+    if cur_entry is not None:
+        bits.append(f"Position entry {_fmt_level(cur_entry)}.")
+    if cur_stop is not None or cur_tp is not None:
+        st_txt = _fmt_level(cur_stop) if cur_stop is not None else "not visible"
+        tp_txt = _fmt_level(cur_tp) if cur_tp is not None else "not visible"
+        bits.append(f"Current stop {st_txt}, target {tp_txt}.")
+
+    # Use the current bullish TradePlan as the refreshed suggestion (already uses indicators + L2).
+    new_stop = plan.stop
+    new_tp = (plan.targets[0] if getattr(plan, "targets", None) else None)
+
+    if new_stop is None and new_tp is None:
+        bits.append("No clear updated stop or target is suggested from the current read.")
+        return " ".join(bits)
+
+    # Compare to existing levels when visible.
+    tol_stop = max(0.01, abs(float(cur_stop)) * 0.001) if cur_stop is not None else 0.01
+    tol_tp = max(0.01, abs(float(cur_tp)) * 0.001) if cur_tp is not None else 0.01
+
+    if new_stop is not None:
+        if cur_stop is None:
+            bits.append(f"Suggested stop {_fmt_level(new_stop)}.")
+        elif abs(float(new_stop) - float(cur_stop)) <= tol_stop:
+            bits.append(f"Stop looks acceptable near {_fmt_level(cur_stop)}.")
+        elif float(new_stop) > float(cur_stop):
+            bits.append(f"Consider raising stop to {_fmt_level(new_stop)}.")
+        else:
+            bits.append(f"Consider widening stop to {_fmt_level(new_stop)} only if size allows.")
+
+    if new_tp is not None:
+        if cur_tp is None:
+            bits.append(f"Suggested target {_fmt_level(new_tp)}.")
+        elif abs(float(new_tp) - float(cur_tp)) <= tol_tp:
+            bits.append(f"Target remains reasonable near {_fmt_level(cur_tp)}.")
+        elif float(new_tp) < float(cur_tp):
+            bits.append(f"Consider lowering target to {_fmt_level(new_tp)} if momentum is weakening.")
+        else:
+            bits.append(f"Consider extending target to {_fmt_level(new_tp)} if bids continue to support.")
+
+    return " ".join(bits)
+
+
 def build_trade_transcript(
     facts: ChartFacts,
     plan: TradePlan,
@@ -638,6 +709,9 @@ def build_trade_transcript(
 
         if mode == "brief":
             bits = [f"{symbol}.", f"Price {price}."]
+            pos_line = _position_recheck_line(facts, plan, mode=mode)
+            if pos_line:
+                bits.append(pos_line)
             l2_line = _voice_l2_commentary(l2_comment)
             if l2_line:
                 bits.append(l2_line)
@@ -646,6 +720,9 @@ def build_trade_transcript(
 
         if mode == "momentum":
             bits = [f"{symbol}.", f"Price {price}."]
+            pos_line = _position_recheck_line(facts, plan, mode=mode)
+            if pos_line:
+                bits.append(pos_line)
             if reason:
                 bits.append(reason + ".")
             l2_line = _voice_l2_commentary(l2_comment)
@@ -664,6 +741,9 @@ def build_trade_transcript(
 
     if mode == "brief":
         bits = [f"{symbol}.", quality_spoken + "."]
+        pos_line = _position_recheck_line(facts, plan, mode=mode)
+        if pos_line:
+            bits.append(pos_line)
         if entry and stop and t1:
             bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
         elif entry and stop:
@@ -675,6 +755,9 @@ def build_trade_transcript(
 
     if mode == "momentum":
         bits = [f"{symbol}.", quality_spoken + "."]
+        pos_line = _position_recheck_line(facts, plan, mode=mode)
+        if pos_line:
+            bits.append(pos_line)
         if entry and stop and t1:
             bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
         if entry and stop:
