@@ -11,7 +11,12 @@ from fastapi.staticfiles import StaticFiles
 from tts import generate_tts_mp3
 from vision.pipeline import analyze_chart_image_bytes
 from vision.l2_pipeline import analyze_l2_image_bytes, compute_l2_delta, build_l2_commentary
-from vision.trade_logic import build_trade_plan, build_trade_transcript
+from vision.trade_logic import (
+    build_trade_plan,
+    build_momentum_trade_plan,
+    build_trade_transcript,
+    should_keep_looking_from_plan,
+)
 
 app = FastAPI(title="TradeTalkerAI API")
 
@@ -151,19 +156,25 @@ async def analyze(
     except Exception as e:
         l2_comment = f"Level 2 read failed: {type(e).__name__}: {e}"
 
-    # 3) TradePlan
-    trade_plan = build_trade_plan(chart_facts, l2_1, l2_2, l2_delta)
+    # 3) TradePlan (mode-aware planner)
+    mode_norm = (mode or "brief").strip().lower()
+    if mode_norm in ("momentum", "momo", "mom"):
+        trade_plan = build_momentum_trade_plan(chart_facts, l2_1, l2_2, l2_delta)
+    else:
+        trade_plan = build_trade_plan(chart_facts, l2_1, l2_2, l2_delta)
 
     # 4) Transcript (now mode actually changes output)
     transcript = build_trade_transcript(chart_facts, trade_plan, l2_comment=(l2_comment if l2_is_meaningful(l2_comment) else None), mode=mode)
 
-    keep_looking = bool(
-        (chart_facts.confidence is not None and chart_facts.confidence < 0.55)
-        or (chart_facts.setup in (None, "unclear", "range"))
-        or (not chart_facts.symbol)
-        or (not chart_facts.timeframe)
-        or bool(trade_plan.step_aside)
-        or (trade_plan.quality in ("D", "F"))
+    keep_looking = should_keep_looking_from_plan(
+        trade_plan,
+        mode=mode,
+        preexisting_keep_looking=bool(
+            (chart_facts.confidence is not None and chart_facts.confidence < 0.55)
+            or (chart_facts.setup in (None, "unclear", "range"))
+            or (not chart_facts.symbol)
+            or (not chart_facts.timeframe)
+        ),
     )
     verdict = "keep_looking" if keep_looking else "actionable"
 

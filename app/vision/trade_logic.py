@@ -210,6 +210,309 @@ def build_trade_plan(
     return plan
 
 
+def build_momentum_trade_plan(
+    facts: ChartFacts,
+    l2_frame1: Optional[L2Snapshot] = None,
+    l2_frame2: Optional[L2Snapshot] = None,
+    l2_delta: Optional[L2Delta] = None,
+) -> TradePlan:
+    """Bullish-only MOMENTUM-specific plan generator.
+    Stricter than build_trade_plan():
+      - prefers breakout / clean reclaim setups
+      - enforces no-chase behavior
+      - requires room to first target
+      - weights L2 more heavily when visible
+      - produces tighter, execution-focused plans
+    """
+    plan = TradePlan(side="none")
+
+    if facts.confidence < 0.55 or not facts.symbol or not facts.timeframe or facts.setup in (None, "unclear"):
+        plan.step_aside.append("Low confidence or unclear setup")
+        plan.rationale.append("Momentum mode requires a clear chart read and setup classification")
+        return plan
+
+    price = facts.last_price
+    if price is None:
+        plan.step_aside.append("Missing last_price")
+        plan.rationale.append("No readable last_price on screenshot")
+        return plan
+
+    setup = (facts.setup or "unclear").strip().lower()
+    if setup in ("range", "unclear"):
+        plan.step_aside.append("Momentum requires breakout or reclaim structure")
+        plan.rationale.append(f"Setup={setup} is too ambiguous for momentum execution")
+        return plan
+
+    buf = _buffer(price)
+    l2s = _l2_score(l2_frame1, l2_frame2, l2_delta)
+
+    support = sorted(set([float(x) for x in (facts.support or [])]))
+    resistance = sorted(set([float(x) for x in (facts.resistance or [])]))
+
+    vwap = facts.vwap
+    ema9 = facts.ema9
+    ema21 = facts.ema21
+
+    ma_stack = [x for x in [vwap, ema9, ema21] if x is not None]
+    ma_mid = sum(ma_stack) / len(ma_stack) if ma_stack else None
+
+    trend_score = 0.0
+    trend_notes: list[str] = []
+
+    if vwap is not None:
+        if price >= vwap:
+            trend_score += 1.0
+            trend_notes.append("price >= VWAP")
+        else:
+            trend_score -= 1.0
+            trend_notes.append("price < VWAP")
+
+    if ema9 is not None:
+        if price >= ema9:
+            trend_score += 1.0
+            trend_notes.append("price >= EMA9")
+        else:
+            trend_score -= 0.5
+            trend_notes.append("price < EMA9")
+
+    if ema9 is not None and ema21 is not None:
+        if ema9 >= ema21:
+            trend_score += 1.0
+            trend_notes.append("EMA9 >= EMA21")
+        else:
+            trend_score -= 1.0
+            trend_notes.append("EMA9 < EMA21")
+
+    if trend_score <= -1.5:
+        plan.step_aside.append("Trend alignment weak for momentum (VWAP/EMA stack)")
+        plan.rationale.append(" / ".join(trend_notes) if trend_notes else "Weak trend alignment")
+        return plan
+
+    plan.side = "long"
+    plan.rationale.append(f"Momentum setup={setup}, confidence={facts.confidence:.2f}, l2_score={l2s:+.2f}")
+    if trend_notes:
+        plan.rationale.append("Trend: " + "; ".join(trend_notes))
+
+    trigger = None
+    stop_ref = None
+
+    if setup == "breakout":
+        breakout_level = _nearest_above(resistance, price) or price
+        trigger = breakout_level + buf
+        plan.entry = trigger
+
+        stop_ref = _nearest_below(support, breakout_level)
+        if stop_ref is None and ma_mid is not None:
+            stop_ref = ma_mid
+        if stop_ref is None:
+            stop_ref = price - (buf * 5)
+        plan.stop = stop_ref - buf
+
+        plan.rationale.append("Breakout momentum: trigger over resistance with tight invalidation under support/MA")
+
+    elif setup == "pullback":
+        reclaim_candidates = [x for x in [ema9, vwap, ma_mid] if x is not None]
+        reclaim_base = max(reclaim_candidates) if reclaim_candidates else None
+
+        if reclaim_base is None:
+            first_res = _nearest_above(resistance, price)
+            if first_res is not None:
+                trigger = first_res + buf
+            else:
+                trigger = price + buf
+        else:
+            trigger = reclaim_base + buf
+
+        plan.entry = trigger
+
+        stop_ref = _nearest_below(support, trigger)
+        if stop_ref is None:
+            for alt in [vwap, ema21, ma_mid]:
+                if alt is not None and alt < trigger:
+                    stop_ref = alt
+                    break
+        if stop_ref is None:
+            stop_ref = price - (buf * 6)
+
+        plan.stop = stop_ref - buf
+        plan.rationale.append("Pullback momentum: reclaim trigger with invalidation below support/VWAP/EMA")
+
+    elif setup == "failed breakout":
+        if l2_frame1 and l2_frame1.ladder_visible and l2s <= -0.15:
+            plan.step_aside.append("Failed breakout with weak L2 confirmation")
+            plan.rationale.append("Momentum mode rejects failed-breakout reclaims when L2 is bearish")
+            plan.side = "none"
+            plan.entry = None
+            plan.stop = None
+            plan.targets = []
+            return plan
+
+        reclaim = None
+        for cand in [vwap, ema9, ma_mid]:
+            if cand is not None:
+                reclaim = cand
+                break
+
+        if reclaim is None:
+            plan.step_aside.append("Failed breakout needs a reclaim reference")
+            plan.rationale.append("No VWAP/EMA/MA reclaim level visible")
+            plan.side = "none"
+            return plan
+
+        trigger = reclaim + buf
+        plan.entry = trigger
+
+        stop_ref = _nearest_below(support, reclaim)
+        if stop_ref is None:
+            stop_ref = reclaim - (buf * 6)
+        plan.stop = stop_ref - buf
+
+        plan.rationale.append("Failed-breakout reclaim allowed only with reclaim trigger and non-bearish L2")
+
+    else:
+        plan.step_aside.append("Unsupported setup for momentum mode")
+        plan.rationale.append(f"Setup={setup}")
+        plan.side = "none"
+        return plan
+
+    if plan.entry is None or plan.stop is None:
+        plan.step_aside.append("Incomplete momentum plan")
+        plan.rationale.append("Missing entry/stop after setup logic")
+        plan.side = "none"
+        return plan
+
+    if plan.stop >= plan.entry:
+        repaired_stop = plan.entry - max(buf * 4, 0.02)
+        plan.rationale.append("Repaired stop geometry using momentum fallback stop")
+        plan.stop = repaired_stop
+
+    t1 = _nearest_above(resistance, plan.entry + buf)
+    if t1 is not None:
+        plan.targets.append(t1)
+        t2 = _nearest_above(resistance, t1 + buf)
+        if t2 is not None:
+            plan.targets.append(t2)
+    else:
+        risk = plan.entry - plan.stop
+        if risk > 0:
+            plan.targets = [plan.entry + risk * 1.4, plan.entry + risk * 2.0]
+        else:
+            plan.targets = []
+
+    risk_now = max(plan.entry - plan.stop, 0.0)
+    chase_allowance = max(buf * 2, min(0.08, risk_now * 0.35))
+    if price > (plan.entry + chase_allowance):
+        plan.step_aside.append("Extended above trigger — no-chase momentum")
+        plan.rationale.append(
+            f"Price {price:.4f} is already above trigger {plan.entry:.4f} beyond chase allowance"
+        )
+
+    if plan.targets:
+        rr_val = _rr(plan.entry, plan.stop, plan.targets[0])
+        plan.rr = round(rr_val, 2) if rr_val is not None else None
+    else:
+        plan.rr = None
+
+    if plan.rr is None:
+        plan.step_aside.append("No valid target / RR for momentum entry")
+    elif plan.rr < 1.2:
+        plan.step_aside.append("RR too low for momentum (< 1.2)")
+        plan.rationale.append("Overhead room is too tight relative to risk")
+
+    if plan.targets:
+        t1_dist = plan.targets[0] - plan.entry
+        if risk_now > 0 and t1_dist <= (risk_now * 1.15):
+            plan.step_aside.append("Overhead resistance too close for momentum")
+            plan.rationale.append("First target too near vs required momentum risk")
+
+    if l2_frame1 and l2_frame1.ladder_visible:
+        if l2s <= -0.25:
+            plan.step_aside.append("L2 pressure bearish for momentum")
+            plan.rationale.append("Bid pull / ask add pattern weakens breakout follow-through")
+        elif l2s >= 0.20:
+            plan.rationale.append("L2 confirms momentum (supportive bid/ask pressure)")
+    else:
+        plan.rationale.append("No L2 visible — momentum plan built from chart only")
+
+    score = 0.0
+    if setup in ("breakout", "pullback"):
+        score += 2.0
+    elif setup == "failed breakout":
+        score += 1.0
+
+    score += max(0.0, min(3.0, trend_score + 1.0))
+
+    if facts.confidence >= 0.90:
+        score += 2.0
+    elif facts.confidence >= 0.80:
+        score += 1.5
+    elif facts.confidence >= 0.70:
+        score += 1.0
+    elif facts.confidence >= 0.60:
+        score += 0.5
+
+    if plan.rr is not None:
+        if plan.rr >= 2.5:
+            score += 2.0
+        elif plan.rr >= 1.8:
+            score += 1.5
+        elif plan.rr >= 1.4:
+            score += 1.0
+        elif plan.rr >= 1.2:
+            score += 0.5
+
+    if l2_frame1 and l2_frame1.ladder_visible:
+        if l2s >= 0.35:
+            score += 1.0
+        elif l2s >= 0.15:
+            score += 0.5
+        elif l2s <= -0.35:
+            score -= 2.0
+        elif l2s <= -0.15:
+            score -= 1.0
+
+    score -= 1.0 * len(plan.step_aside)
+
+    if score >= 8.0:
+        q = "A"
+    elif score >= 6.5:
+        q = "B"
+    elif score >= 5.0:
+        q = "C"
+    elif score >= 4.0:
+        q = "D"
+    else:
+        q = "F"
+
+    if (not l2_frame1 or not l2_frame1.ladder_visible) and q == "A":
+        q = "B"
+        plan.rationale.append("A-grade capped to B (no L2 confirmation visible)")
+
+    if plan.step_aside and q in ("A", "B", "C"):
+        q = "D" if q == "C" else "C"
+
+    plan.quality = q  # type: ignore
+
+    blocker_phrases = (
+        "Extended above trigger",
+        "RR too low",
+        "Overhead resistance too close",
+        "L2 pressure bearish",
+        "Low confidence",
+        "Momentum requires breakout or reclaim structure",
+    )
+    if any(any(bp in s for bp in blocker_phrases) for s in plan.step_aside):
+        plan.side = "none"
+
+    plan.targets = sorted(set([round(float(t), 4) for t in plan.targets]))
+    if plan.entry is not None:
+        plan.entry = round(float(plan.entry), 4)
+    if plan.stop is not None:
+        plan.stop = round(float(plan.stop), 4)
+
+    return plan
+
+
 def _fmt_level(x: float) -> str:
     return f"{x:.2f}".rstrip("0").rstrip(".")
 
@@ -238,6 +541,44 @@ def _mode_norm(mode: str | None) -> str:
     return m
 
 
+_MOMENTUM_HARD_BLOCKER_PHRASES = (
+    "Low confidence",
+    "Missing last_price",
+    "Momentum requires breakout or reclaim structure",
+    "Unsupported setup for momentum mode",
+    "Incomplete momentum plan",
+    "No valid target / RR for momentum entry",
+    "RR too low",
+    "Overhead resistance too close",
+    "Extended above trigger",
+    "L2 pressure bearish",
+    "Failed breakout with weak L2 confirmation",
+)
+
+
+def trade_plan_has_hard_blockers(plan: TradePlan, mode: str = "brief") -> bool:
+    mode_norm = (mode or "brief").strip().lower()
+    if mode_norm in ("momentum", "momo", "mom"):
+        return any(
+            any(p in (reason or "") for p in _MOMENTUM_HARD_BLOCKER_PHRASES)
+            for reason in (plan.step_aside or [])
+        )
+    return bool(plan.step_aside)
+
+
+def should_keep_looking_from_plan(
+    plan: TradePlan,
+    mode: str = "brief",
+    preexisting_keep_looking: bool = False,
+) -> bool:
+    return bool(
+        preexisting_keep_looking
+        or plan.side != "long"
+        or (plan.quality in ("D", "F"))
+        or trade_plan_has_hard_blockers(plan, mode=mode)
+    )
+
+
 def build_trade_transcript(
     facts: ChartFacts,
     plan: TradePlan,
@@ -264,7 +605,7 @@ def build_trade_transcript(
         or setup in ("unclear", "range")
         or plan.side in (None, "none")
         or plan.quality in ("D", "F")
-        or plan.step_aside
+        or trade_plan_has_hard_blockers(plan, mode=mode)
     ):
         reason = None
         if plan.step_aside:
@@ -302,6 +643,11 @@ def build_trade_transcript(
             bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
         if entry and stop:
             bits.append(f"Trigger {entry}. Invalidate {stop}.")
+        for r in (plan.rationale or []):
+            txt = (r or "").strip().rstrip(".")
+            if txt:
+                bits.append(txt + ".")
+                break
         return " ".join(bits)
 
     bits = [f"{symbol}.", quality_spoken + "."]
