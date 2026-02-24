@@ -76,7 +76,8 @@ async def _ensure_usage_events_columns() -> None:
                     ADD COLUMN IF NOT EXISTS tts_audio_output_tokens integer,
                     ADD COLUMN IF NOT EXISTS analysis_cost_usd numeric(10,6),
                     ADD COLUMN IF NOT EXISTS tts_cost_usd numeric(10,6),
-                    ADD COLUMN IF NOT EXISTS credits_used integer
+                    ADD COLUMN IF NOT EXISTS credits_used integer,
+                    ADD COLUMN IF NOT EXISTS ticker text
                 """)
     except Exception:
         pass
@@ -344,6 +345,7 @@ async def _log_usage(
     device_id: str | None,
     endpoint: str,
     mode: str | None,
+    ticker: str | None,
     num_images: int,
     image_bytes: int,
     payload_bytes: int,
@@ -373,18 +375,18 @@ async def _log_usage(
                 await cur.execute(
                     """
                     INSERT INTO usage_events
-                    (request_id, subscriber_id, device_id, endpoint, mode,
+                    (request_id, subscriber_id, device_id, endpoint, mode, ticker,
                      num_images, image_bytes, payload_bytes,
                      model, prompt_tokens, completion_tokens, total_tokens,
                      api_cost_usd, latency_ms, status_code,
                      response_bytes, response_text_chars, response_text_words,
                      error_type, error_message, pricing_version,
                      tts_text_input_tokens, tts_audio_output_tokens, analysis_cost_usd, tts_cost_usd, credits_used)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     RETURNING id
                     """,
                     (
-                        request_id, subscriber_id, device_id, endpoint, mode,
+                        request_id, subscriber_id, device_id, endpoint, mode, ticker,
                         num_images, image_bytes, payload_bytes,
                         model, prompt_tokens, completion_tokens, total_tokens,
                         api_cost_usd, latency_ms, status_code,
@@ -790,6 +792,7 @@ async def analyze(
         device_id=device_id,
         endpoint=endpoint,
         mode=mode,
+        ticker=(chart_facts.symbol if chart_facts else None),
         num_images=num_images,
         image_bytes=image_bytes,
         payload_bytes=payload_bytes,
