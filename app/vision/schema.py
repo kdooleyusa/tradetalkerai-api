@@ -28,6 +28,15 @@ class ChartFacts(BaseModel):
     setup: SetupType = "unclear"
 
     confidence: float = 0.0
+
+    # Optional on-chart position overlay (Webull/TradingView/etc.) if visible
+    position_visible: bool = False
+    position_side: Optional[str] = None  # long / short / null if unclear
+    position_qty: Optional[float] = None
+    position_entry_price: Optional[float] = None
+    position_stop_price: Optional[float] = None
+    position_target_price: Optional[float] = None
+
     notes: List[str] = Field(default_factory=list)
 
 
