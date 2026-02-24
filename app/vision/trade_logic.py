@@ -579,6 +579,29 @@ def should_keep_looking_from_plan(
     )
 
 
+def _voice_l2_commentary(l2_comment: str | None) -> str | None:
+    """Normalize L2 commentary for BRIEF/MOMENTUM so a visible ladder is always addressed."""
+    if not l2_comment:
+        return None
+    raw = (l2_comment or "").strip()
+    if not raw:
+        return None
+    low = raw.lower()
+
+    # Make low-signal / insufficient reads explicit instead of vague.
+    if "delta captured" in low:
+        return "Level two is visible, but not enough change is shown yet to read pressure or sweeps clearly."
+    if "snapshot captured" in low:
+        return "Level two is visible, but there is only a snapshot, so pressure and stacking are limited."
+    if "book looks fairly balanced" in low:
+        return "Level two looks fairly balanced, so pressure is mixed right now."
+
+    # Minor wording cleanup for voice.
+    if raw.endswith('.'):
+        return raw
+    return raw + '.'
+
+
 def build_trade_transcript(
     facts: ChartFacts,
     plan: TradePlan,
@@ -614,12 +637,22 @@ def build_trade_transcript(
             reason = plan.rationale[0].rstrip(".")
 
         if mode == "brief":
-            return f"{symbol}. Price {price}. Move on."
+            bits = [f"{symbol}.", f"Price {price}."]
+            l2_line = _voice_l2_commentary(l2_comment)
+            if l2_line:
+                bits.append(l2_line)
+            bits.append("Move on.")
+            return " ".join(bits)
 
         if mode == "momentum":
+            bits = [f"{symbol}.", f"Price {price}."]
             if reason:
-                return f"{symbol}. Price {price}. {reason}. Move on."
-            return f"{symbol}. Price {price}. Move on."
+                bits.append(reason + ".")
+            l2_line = _voice_l2_commentary(l2_comment)
+            if l2_line:
+                bits.append(l2_line)
+            bits.append("Move on.")
+            return " ".join(bits)
 
         if reason:
             return f"{symbol}. Price {price}. {reason}. Move on."
@@ -635,6 +668,9 @@ def build_trade_transcript(
             bits.append(f"Entry {entry}, stop {stop}, target {t1}.")
         elif entry and stop:
             bits.append(f"Entry {entry}, stop {stop}.")
+        l2_line = _voice_l2_commentary(l2_comment)
+        if l2_line:
+            bits.append(l2_line)
         return " ".join(bits)
 
     if mode == "momentum":
@@ -648,6 +684,9 @@ def build_trade_transcript(
             if txt:
                 bits.append(txt + ".")
                 break
+        l2_line = _voice_l2_commentary(l2_comment)
+        if l2_line:
+            bits.append(l2_line)
         return " ".join(bits)
 
     bits = [f"{symbol}.", quality_spoken + "."]
