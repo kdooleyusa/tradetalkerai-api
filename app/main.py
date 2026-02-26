@@ -259,19 +259,24 @@ async def _debit_credits_usage(
                 await cur.execute(
                     """
                     WITH bal AS (
-                      SELECT COALESCE(SUM(credits_delta), 0)::integer AS b
+                      SELECT GREATEST(COALESCE(SUM(credits_delta), 0)::integer, 0) AS b
                       FROM credit_ledger
                       WHERE subscriber_id = %s
                     ),
                     ins AS (
                       INSERT INTO credit_ledger
                       (subscriber_id, event_type, credits_delta, balance_after, usage_event_id, request_id, note, created_by)
-                      SELECT %s, 'usage', %s, ((SELECT b FROM bal) + %s), %s, %s, %s, 'system'
+                      SELECT
+                        %s,
+                        'usage',
+                        (-LEAST(%s, (SELECT b FROM bal))),
+                        GREATEST(((SELECT b FROM bal) - %s), 0),
+                        %s, %s, %s, 'system'
                       RETURNING balance_after
                     )
                     SELECT balance_after FROM ins
                     """,
-                    (subscriber_id, subscriber_id, -credits_used, -credits_used, usage_event_id, request_id, note or 'Analyze request credits'),
+                    (subscriber_id, subscriber_id, credits_used, credits_used, usage_event_id, request_id, note or 'Analyze request credits'),
                 )
                 row = await cur.fetchone()
                 return int(row[0]) if row and row[0] is not None else None
@@ -291,7 +296,8 @@ async def _get_credit_balance(subscriber_id: str | None) -> int | None:
                     (subscriber_id,),
                 )
                 row = await cur.fetchone()
-                return int(row[0]) if row and row[0] is not None else 0
+                val = int(row[0]) if row and row[0] is not None else 0
+                return max(0, val)
     except Exception:
         return None
 
@@ -609,6 +615,42 @@ async def analyze(
         ip=ip,
         user_agent=user_agent,
     )
+
+
+    # --- Credit gate ---
+    bal = await _get_credit_balance(subscriber_id)
+    if (bal is not None) and (bal < 1):
+        msg = "You have 0 credits remaining. Please Top-Up more credits or upgrade your plan."
+        await _log_entitlement(
+            request_id=request_id,
+            subscriber_id=subscriber_id,
+            device_id=device_id,
+            endpoint=endpoint,
+            decision="DENY",
+            reason="insufficient_credits",
+            ip=ip,
+            user_agent=user_agent,
+        )
+        latency = int((time.perf_counter() - t0) * 1000)
+        await _log_usage(
+            request_id=request_id,
+            subscriber_id=subscriber_id,
+            device_id=device_id,
+            endpoint=endpoint,
+            mode=mode,
+            ticker=None,
+            num_images=num_images,
+            image_bytes=image_bytes,
+            payload_bytes=payload_bytes,
+            model=model,
+            prompt_tokens=None,
+            completion_tokens=None,
+            total_tokens=None,
+            api_cost_usd=None,
+            latency_ms=latency,
+            status_code=402,
+        )
+        raise HTTPException(status_code=402, detail=msg)
 
     usage_meta_items: list[dict] = []
     pricing_version = os.getenv("OPENAI_PRICING_VERSION") or "local_unset"
